@@ -52,11 +52,11 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 logger = logging.getLogger(__name__)
 
 
-# --------------------------- MoRIEP Dispatch Output ---------------------------------
-# TODO: Change the output format to meet MoRIEP Dispatch output
+# --------------------------- MoRI Dispatch Output ---------------------------------
+# TODO: Change the output format to meet MoRI Dispatch output
 
-class MoRIEPNormalOutput(NamedTuple):
-    """MoRIEP normal dispatch output."""
+class MoRINormalOutput(NamedTuple):
+    """MoRI normal dispatch output."""
 
     hidden_states: torch.Tensor | Tuple[torch.Tensor, torch.Tensor]
     # hidden_states_scale
@@ -68,8 +68,8 @@ class MoRIEPNormalOutput(NamedTuple):
     def format(self) -> DispatchOutputFormat:
         return DispatchOutputFormat.MORIEP_NORMAL
     
-class MoRIEPLLOutput(NamedTuple):
-    """MoRIEP low latency dispatch output."""
+class MoRILLOutput(NamedTuple):
+    """MoRI low latency dispatch output."""
 
     hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor]
     topk_idx: torch.Tensor
@@ -81,15 +81,15 @@ class MoRIEPLLOutput(NamedTuple):
     def format(self) -> DispatchOutputFormat:
         return DispatchOutputFormat.MORIEP_LL
 
-assert isinstance(MoRIEPNormalOutput, DispatchOutput)
-assert isinstance(MoRIEPLLOutput, DispatchOutput)
+assert isinstance(MoRINormalOutput, DispatchOutput)
+assert isinstance(MoRILLOutput, DispatchOutput)
 
 
-# ----------------------------- MoRIEP Combine Input ----------------------------------
-# TODO: Change the input format to meet MoRIEP Combine input
+# ----------------------------- MoRI Combine Input ----------------------------------
+# TODO: Change the input format to meet MoRI Combine input
 
-class MoRIEPNormalCombineInput(NamedTuple):
-    """MoRIEP normal combine input."""
+class MoRINormalCombineInput(NamedTuple):
+    """MoRI normal combine input."""
 
     pass
 
@@ -97,8 +97,8 @@ class MoRIEPNormalCombineInput(NamedTuple):
     def format(self) -> CombineInputFormat:
         return CombineInputFormat.MORIEP_NORMAL
     
-class MoRIEPLLCombineInput(NamedTuple):
-    """MoRIEP low latency combine input."""
+class MoRILLCombineInput(NamedTuple):
+    """MoRI low latency combine input."""
 
     pass
 
@@ -106,54 +106,38 @@ class MoRIEPLLCombineInput(NamedTuple):
     def format(self) -> CombineInputFormat:
         return CombineInputFormat.MORIEP_LL
 
-assert isinstance(MoRIEPNormalCombineInput, CombineInput)
-assert isinstance(MoRIEPLLCombineInput, CombineInput)
+assert isinstance(MoRINormalCombineInput, CombineInput)
+assert isinstance(MoRILLCombineInput, CombineInput)
 
 
-class MoRIEPDispatchMode(IntEnum):
+class MoRIDispatchMode(IntEnum):
     NORMAL = auto()
     LOW_LATENCY = auto()
 
 # NOTE: Actually... not needed, only skeleton code
-#       actual implementation should be done inside of MoRIEPDispatcher
+#       actual implementation should be done inside of MoRIDispatcher
 class MoRIBuffer:
     pass
 
+# NOTE: Actually... not needed, only skeleton code
+#       actual implementation should be done inside of MoRIDispatcher
 class MoRIConfig(BaseDispatcherConfig):
-    _instance = None
-    
-    def __init__(
-        self,
-        data_type: torch.dtype,
-        rank: int,
-        world_size: int,
-        hidden_dim: int,
-        scale_dim: int,
-        scale_type_size: int,
-        max_token_type_size: int,
-        max_num_inp_token_per_rank: int,
-        num_experts_per_rank: int,
-        num_experts_per_token: int,
-        warp_num_per_block: int = 8,
-        block_num: int = 80,
-        use_external_inp_buf: bool = True,
-        kernel_type: EpDispatchCombineKernelType = EpDispatchCombineKernelType.IntraNode
-    ):
-        self.data_type = data_type
+    pass
+        
 
-class _MoRIEPDispatcherImplBase:
+class _MoRIDispatcherImplBase:
     pass
 
-class _MoRIEPDispatcherImplNormal(_MoRIEPDispatcherImplBase):
+class _MoRIDispatcherImplNormal(_MoRIDispatcherImplBase):
     pass
 
-class _MoRIEPDispatcherImplLowLatency(_MoRIEPDispatcherImplBase):
+class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
     pass
 
 
 
 
-class MoRIEPDispatcher(BaseDispatcher):
+class MoRIDispatcher(BaseDispatcher):
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -170,5 +154,64 @@ class MoRIEPDispatcher(BaseDispatcher):
         # TODO: should Implement MORI dispatcher, below is nonsense code for removal
         # NOTE: to implement TBO with MoRI, first use same function name and logic flow
         #       of DeepEPDispatcher (check _use_aiter or _use_hip in deepep.py)
+        self.config = _make_mori_config(...)
+        
         pass
 
+    def _init_mori_shmem():
+        pass
+    
+    def _make_mori_config(
+        self,
+        data_type: torch.dtype = torch.bfloat16,
+        rank: int,
+        world_size: int,
+        hidden_dim: int,
+        scale_dim: int,
+        scale_type_size: int,
+        max_token_type_size: int,
+        max_num_inp_token_per_rank: int,
+        num_experts_per_rank: int,
+        num_experts_per_token: int,
+        # warp_num_per_block: int = 8,
+        # block_num: int = 80,
+        # use_external_inp_buf: bool = True,
+        # kernel_type: EpDispatchCombineKernelType = EpDispatchCombineKernelType.IntraNode
+    ):
+        # Determine data type size
+        dtype_to_size = {
+            torch.float32: 4,
+            torch.bfloat16: 2,
+            torch.float16: 2,
+        }
+        max_token_type_size = dtype_to_size.get(data_type, 2)
+
+        config = EpDispatchCombineConfig(
+            data_type=data_type,
+            rank=self.dp_rank,  # Use dp_rank for expert parallelism
+            world_size=self.dp_world_size,
+            hidden_dim=hidden_dim,
+            max_num_inp_token_per_rank=max_num_tokens,
+            num_experts_per_rank=num_experts_per_rank,
+            num_experts_per_token=num_experts_per_token,
+
+            # Performance tuning parameters (can be optimized later)
+            warp_num_per_block=8,  # Good default for MI300X
+            block_num=80,          # Good default for MI300X
+            max_token_type_size=max_token_type_size,
+
+            # Quantization support (disabled for now)
+            scale_dim=0,
+            scale_type_size=0,
+
+            # Use internal buffer management
+            use_external_inp_buf=False,
+
+            # Determine kernel type based on topology
+            kernel_type=(EpDispatchCombineKernelType.InterNode
+                        if self.internode
+                        else EpDispatchCombineKernelType.IntraNode)
+        )
+
+        return config
+    

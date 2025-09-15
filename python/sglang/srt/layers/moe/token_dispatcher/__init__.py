@@ -18,12 +18,12 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPNormalOutput,
 )
 from sglang.srt.layers.moe.token_dispatcher.mori import (
-    MoRIEPDispatcher,
+    MoRIDispatcher,
     MoRIConfig,
-    MoRIEPLLCombineInput,
-    MoRIEPLLOutput,
-    MoRIEPNormalCombineInput,
-    MoRIEPNormalOutput,        
+    MoRILLCombineInput,
+    MoRILLOutput,
+    MoRINormalCombineInput,
+    MoRINormalOutput,        
 )
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
@@ -48,10 +48,10 @@ __all__ = [
     "DeepEPLLOutput",
     "DeepEPLLCombineInput",
     "DeepEPNormalCombineInput",
-    "MoRIEPDispatcher",
+    "MoRIDispatcher",
     "MoRIConfig",
-    "MoRIEPLLCombineInput",
-    "MoRIEPLLOutput",
-    "MoRIEPNormalCombineInput",
-    "MoRIEPNormalOutput",    
+    "MoRILLCombineInput",
+    "MoRILLOutput",
+    "MoRINormalCombineInput",
+    "MoRINormalOutput",    
 ]

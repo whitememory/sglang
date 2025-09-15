@@ -777,7 +777,9 @@ class DeepEPMoE(EPMoE):
 
         return hidden_states
 
-class MoriEPMoE(EPMoE):
+# NOTE: For now, we'll use DeepEPMoE class for fast development
+#       MoRIEPMoE will be developed later.
+class MoRIEPMoE(EPMoE):
     pass
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
