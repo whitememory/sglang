@@ -823,6 +823,8 @@ class MoRIEPMoE(EPMoE):
         from sglang.srt.distributed.parallel_state import get_tp_group
         from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
         
+        self._shmem_initialized = False
+        self._ensure_shmem_initialized()
         self.mori_dispatcher = MaybeTboDeepEPDispatcher(
             group=get_tp_group().device_group,
             router_topk=self.top_k,
@@ -959,6 +961,61 @@ class MoRIEPMoE(EPMoE):
             ),
             expert_mask=self.expert_mask,
         )
+    
+    # NOTE: Copy from vLLM
+    def _ensure_shmem_initialized(self):
+        """Ensure mori's shared memory system is initialized (lazy initialization)"""
+        if self._shmem_initialized:
+            return
+
+        import mori.shmem
+        import torch.distributed as dist
+
+        try:
+            # Wait for PyTorch distributed to be ready
+            if not dist.is_initialized():
+                raise RuntimeError("PyTorch distributed not initialized yet")
+
+            # Check if we have a valid backend
+            backend = dist.get_backend()
+            if backend is None:
+                raise RuntimeError("No valid distributed backend found")
+
+            logger.debug(f"[rank {self.rank}] PyTorch distributed ready with backend: {backend}")
+
+            current_group = self.cpu_group if self.cpu_group is not None else dist.group.WORLD
+
+            # TODO(inhyeok): make group_name more reasonable
+            group_name = "default"
+            try:
+                import torch._C._distributed_c10d as c10d
+
+                # Try to unregister first in case it exists
+                try:
+                    c10d._unregister_process_group(group_name)
+                except:
+                    pass
+
+                # Register the current process group
+                c10d._register_process_group(group_name, current_group)
+                logger.debug(f"[rank {self.rank}] Registered process group '{group_name}'")
+
+                # Initialize mori shmem with the registered group
+                mori.shmem.shmem_torch_process_group_init(group_name)
+                logger.debug(f"[rank {self.rank}] Torch process group shmem initialization successful")
+                self._shmem_initialized = True
+                return
+
+            except Exception as torch_error:
+                logger.debug(f"[rank {self.rank}] Torch process group shmem init failed: {torch_error}")
+
+            self._shmem_initialized = True
+
+        except Exception as e:
+            logger.error(f"[rank {self.rank}] mori shmem initialization failed: {e}")
+            # Don't fail completely - mark as initialized to avoid retry loops
+            self._shmem_initialized = True
+            logger.warning(f"[rank {self.rank}] Continuing without mori shmem optimization")
 
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):

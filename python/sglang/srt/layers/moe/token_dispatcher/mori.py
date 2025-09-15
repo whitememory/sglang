@@ -136,8 +136,10 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
 
 
 
-
-class MoRIDispatcher(BaseDispatcher):
+# TODO: should Implement MORI dispatcher, below is nonsense code for removal
+# NOTE: to implement TBO with MoRI, first use same function name and logic flow
+#       of DeepEPDispatcher (check _use_aiter or _use_hip in deepep.py)
+class MoRIDispatcher(BaseDispatcher):   
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -151,33 +153,67 @@ class MoRIDispatcher(BaseDispatcher):
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
-        # TODO: should Implement MORI dispatcher, below is nonsense code for removal
-        # NOTE: to implement TBO with MoRI, first use same function name and logic flow
-        #       of DeepEPDispatcher (check _use_aiter or _use_hip in deepep.py)
-        self.config = _make_mori_config(...)
+        # TODO: Clean the unused APIs
+        from sglang.srt.distributed.parallel_state import (
+            get_tensor_model_parallel_rank,
+            get_world_group,
+            get_tp_group,
+            get_moe_expert_parallel_world_size,
+            in_the_same_node_as,
+        )
+        from sglang.srt.layers.dp_attention import (
+            get_attention_tp_rank,
+            is_dp_attention_enabled,
+        )
+
+        self.group = group # We may need change the group to _EP_MOE
+        self._internode = False
+        assert (
+            dist.get_backend(group) != dist.Backend.NCCL
+        ), f"NCCL backend not support inter-node communication"
+        if not all(in_the_same_node_as(group, source_rank=0)):
+            self._internode = True          
+
+        self.rank = (
+            get_attention_tp_rank()
+            if is_dp_attention_enabled()
+            else get_tp_group().rank_in_group
+        )
+        self.world_size = get_tp_group().world_size
+        
+        self.num_max_dispatch_tokens_per_rank = get_int_env_var(
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
+        )
+        
+        self.config = self._make_mori_config(
+            data_type=params_dtype,
+            hidden_dim=hidden_size,
+            rank=self.rank,
+            world_size=self.world_size,
+            max_num_tokens=self.num_max_dispatch_tokens_per_rank,
+            num_experts_per_rank=num_local_experts,
+            num_experts_per_token=router_topk,
+        )
         
         pass
 
-    def _init_mori_shmem():
-        pass
+    # NOTE: Moved to MoRIEPMoE class
+    # def _init_mori_shmem():
+    #     pass
     
     def _make_mori_config(
         self,
         data_type: torch.dtype = torch.bfloat16,
+        hidden_dim: int,
         rank: int,
         world_size: int,
-        hidden_dim: int,
-        scale_dim: int,
-        scale_type_size: int,
-        max_token_type_size: int,
-        max_num_inp_token_per_rank: int,
+        max_num_tokens: int,
         num_experts_per_rank: int,
         num_experts_per_token: int,
-        # warp_num_per_block: int = 8,
-        # block_num: int = 80,
-        # use_external_inp_buf: bool = True,
-        # kernel_type: EpDispatchCombineKernelType = EpDispatchCombineKernelType.IntraNode
+        scale_dim: int = 0,
+        scale_type_size: int = 0,        
     ):
+        
         # Determine data type size
         dtype_to_size = {
             torch.float32: 4,
@@ -188,8 +224,8 @@ class MoRIDispatcher(BaseDispatcher):
 
         config = EpDispatchCombineConfig(
             data_type=data_type,
-            rank=self.dp_rank,  # Use dp_rank for expert parallelism
-            world_size=self.dp_world_size,
+            rank=rank,
+            world_size=world_size,
             hidden_dim=hidden_dim,
             max_num_inp_token_per_rank=max_num_tokens,
             num_experts_per_rank=num_experts_per_rank,
@@ -209,7 +245,7 @@ class MoRIDispatcher(BaseDispatcher):
 
             # Determine kernel type based on topology
             kernel_type=(EpDispatchCombineKernelType.InterNode
-                        if self.internode
+                        if self._internode
                         else EpDispatchCombineKernelType.IntraNode)
         )
 
