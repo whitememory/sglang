@@ -8,6 +8,7 @@ import torch
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe import (
     get_deepep_mode,
+    get_mori_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
     should_use_flashinfer_trtllm_moe,
@@ -39,6 +40,8 @@ if TYPE_CHECKING:
         DeepEPLLOutput,
         DeepEPNormalOutput,
         DispatchOutput,
+        MoRINormalOutput,
+        MoRILLOutput,
     )
 
 _is_hip = is_hip()
@@ -777,14 +780,193 @@ class DeepEPMoE(EPMoE):
 
         return hidden_states
 
-# NOTE: For now, we'll use DeepEPMoE class for fast development
-#       MoRIEPMoE will be developed later.
+# NOTE: Currently, the code of MoRIEPMoE is originated from DeepEPMoE.
+#       We need to change it more mori-specific way as we can possible
 class MoRIEPMoE(EPMoE):
-    pass
+    """
+    MoE Expert Parallel Impl based on mori (https://github.com/ROCm/mori)
+    """
+    
+    _has_printed = False
+    
+    # NOTE: Keep the same interface with DeepEPMoE
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        layer_id: int,
+        num_fused_shared_experts: int = 0,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+    ):
+        super().__init__(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            layer_id=layer_id,
+            num_fused_shared_experts=num_fused_shared_experts,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=prefix,
+            activation=activation,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+        self.mori_mode = get_mori_mode()
+        
+        # TODO: move to the beginning of the file
+        from sglang.srt.distributed.parallel_state import get_tp_group
+        from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
+        
+        self.mori_dispatcher = MaybeTboDeepEPDispatcher(
+            group=get_tp_group().device_group,
+            router_topk=self.top_k,
+            permute_fusion=True,
+            num_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
+            hidden_size=hidden_size,
+            params_dtype=params_dtype,
+            mori_mode=self.mori_mode,
+            async_finish=True,  # TODO
+            return_recv_hook=True,
+        )
+
+        if _use_aiter:
+            # expert_mask is of size (self.num_local_experts + 1),
+            # the extra 1 is for invalid rank_id (in original deepep, the invalid rank_id is -1, but aiter does not allow -1, we use a mask to make those ids invalid)
+            # for instance, if we have 4 experts on this rank, we would have a expert_mask like:
+            #     self.expert_mask = [1, 1, 1, 1, 0]
+            # idx from 0-3 is valid and will be processed, while idx == 4 will be masked out
+            self.expert_mask = torch.zeros(
+                (self.num_local_experts + 1),
+                device=torch.cuda.current_device(),
+                dtype=torch.int,
+            )
+            # the last one is invalid rank_id
+            self.expert_mask[:-1] = 1
+        elif not _is_npu:
+            self.w13_weight_fp8 = (
+                self.w13_weight,
+                (
+                    self.w13_weight_scale_inv
+                    if self.use_block_quant
+                    else self.w13_weight_scale
+                ),
+            )
+            self.w2_weight_fp8 = (
+                self.w2_weight,
+                (
+                    self.w2_weight_scale_inv
+                    if self.use_block_quant
+                    else self.w2_weight_scale
+                ),
+            )
+            
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        dispatch_output = self.dispatch(
+            hidden_states, topk_idx, topk_weights, forward_batch
+        )
+        hidden_states = self.moe_impl(dispatch_output)
+        hidden_states = self.combine(
+            hidden_states,
+            dispatch_output.topk_idx,
+            dispatch_output.topk_weights,
+            forward_batch,
+        )
+        return hidden_states
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        return self.deepep_dispatcher.dispatch(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            forward_batch=forward_batch,
+        )
+    
+    def moe_impl(self, dispatch_output: DispatchOutput):
+        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+        if _use_aiter:
+            assert DispatchOutputChecker.format_is_mori(dispatch_output)
+            # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
+            return self.forward_aiter(dispatch_output)
+        else:
+            raise ValueError(
+                f"Dispatch output format {dispatch_output.format} is not supported"
+            )
+    
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        return self.mori_dispatcher.combine(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            forward_batch=forward_batch,
+        )
+
+    def forward_aiter(
+        self,
+        dispatch_output: Union[MoRINormalOutput, MoRILLOutput],
+    ):
+        hidden_states, topk_idx, topk_weights = (
+            dispatch_output.hidden_states,
+            dispatch_output.topk_idx,
+            dispatch_output.topk_weights,
+        )
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+        # in original deepep, idx == -1 meaning invalid and will not be processed.
+        # aiter does not accept -1, we use a expert mask to make these idx invalid
+        # (idx == num_local_experts) meaning not used in aiter fused_moe
+        topk_idx_copy = topk_idx.to(torch.int32)
+        topk_idx_copy[topk_idx_copy == -1] = self.num_local_experts
+
+        return fused_moe(
+            hidden_states,
+            self.w13_weight,
+            self.w2_weight,
+            topk_weights,
+            topk_idx_copy,
+            w1_scale=self.w13_weight_scale_inv,
+            w2_scale=self.w2_weight_scale_inv,
+            quant_type=QuantType.per_128x128,
+            activation=(
+                ActivationType.Silu
+                if self.moe_runner_config.activation == "silu"
+                else ActivationType.Gelu
+            ),
+            expert_mask=self.expert_mask,
+        )
+
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
-    if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori():
+    if get_moe_a2a_backend().is_deepep():
         return DeepEPMoE
+    
+    if get_moe_a2a_backend().is_mori():
+        return MoRIEPMoE
 
     # NEW: Direct FP4 detection (bypasses EP requirements)
     # Check for FP4 quantization with TRTLLM flag, regardless of EP
