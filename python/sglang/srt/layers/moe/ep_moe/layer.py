@@ -5,7 +5,10 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
-from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
+from sglang.srt.distributed.parallel_state import (
+    get_moe_expert_parallel_world_size, 
+    _MOE_EP,
+)
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_mori_mode,
@@ -779,8 +782,10 @@ class DeepEPMoE(EPMoE):
 
         return hidden_states
 
+_SHMEM_INITIALIZED = False
+
 # NOTE: Currently, the code of MoRIEPMoE is originated from DeepEPMoE.
-#       We need to change it more mori-specific way as we can possible
+#       We need to change it more mori-specific way as we can possible.
 class MoRIEPMoE(EPMoE):
     """
     MoE Expert Parallel Impl based on mori (https://github.com/ROCm/mori)
@@ -819,13 +824,12 @@ class MoRIEPMoE(EPMoE):
         self.mori_mode = get_mori_mode()
         
         # TODO: move to the beginning of the file
-        from sglang.srt.distributed.parallel_state import get_tp_group
+        from sglang.srt.distributed.parallel_state import get_tp_group, get_moe_ep_group
         from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
         
-        self._shmem_initialized = False
         self._ensure_shmem_initialized()
         self.mori_dispatcher = MaybeTboDeepEPDispatcher(
-            group=get_tp_group().device_group,
+            group=get_moe_ep_group().device_group,
             router_topk=self.top_k,
             permute_fusion=True,
             num_experts=self.num_experts,
@@ -911,10 +915,7 @@ class MoRIEPMoE(EPMoE):
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
             return self.forward_aiter(dispatch_output)
         else:
-            raise NotImplementedError(
-                #f"Dispatch output format {dispatch_output.format} is not supported"
-                f"Currently, only aiter is supported."
-            )
+            raise NotImplementedError(f"Currently, only aiter kernel is supported.")
     
     def combine(
         self,
@@ -964,10 +965,11 @@ class MoRIEPMoE(EPMoE):
             expert_mask=self.expert_mask,
         )
     
-    # NOTE: Copy from ihbang's vLLM-mori impl PR
+    # NOTE: Copy from ihbang's vLLM-mori impl PR.
+    # TODO: We should test this function later.
     def _ensure_shmem_initialized(self):
         """Ensure mori's shared memory system is initialized (lazy initialization)"""
-        if self._shmem_initialized:
+        if _SHMEM_INITIALIZED:
             return
 
         import mori.shmem
@@ -982,10 +984,10 @@ class MoRIEPMoE(EPMoE):
             backend = dist.get_backend()
             if backend is None:
                 raise RuntimeError("No valid distributed backend found")
+            
+            logger.debug(f"[rank {self.moe_ep_rank}] PyTorch distributed ready with backend: {backend}")
 
-            logger.debug(f"[rank {self.rank}] PyTorch distributed ready with backend: {backend}")
-
-            current_group = self.cpu_group if self.cpu_group is not None else dist.group.WORLD
+            current_group = _MOE_EP.cpu_group if _MOE_EP.cpu_group is not None else dist.group.WORLD
 
             # TODO(inhyeok): make group_name more reasonable
             group_name = "default"
@@ -1000,24 +1002,26 @@ class MoRIEPMoE(EPMoE):
 
                 # Register the current process group
                 c10d._register_process_group(group_name, current_group)
-                logger.debug(f"[rank {self.rank}] Registered process group '{group_name}'")
+                logger.debug(f"[rank {self.moe_ep_rank}] Registered process group '{group_name}'")
 
                 # Initialize mori shmem with the registered group
                 mori.shmem.shmem_torch_process_group_init(group_name)
-                logger.debug(f"[rank {self.rank}] Torch process group shmem initialization successful")
-                self._shmem_initialized = True
+                logger.debug(f"[rank {self.moe_ep_rank}] Torch process group shmem initialization successful")
+                _SHMEM_INITIALIZED = True
                 return
 
             except Exception as torch_error:
-                logger.debug(f"[rank {self.rank}] Torch process group shmem init failed: {torch_error}")
+                logger.debug(f"[rank {self.moe_ep_rank}] Torch process group shmem init failed: {torch_error}")
 
-            self._shmem_initialized = True
+            _SHMEM_INITIALIZED = True
 
         except Exception as e:
-            logger.error(f"[rank {self.rank}] mori shmem initialization failed: {e}")
+            # NOTE: Do we need continuing the shmem initialization even it failed?
+            #       I think raising error is more proper in this scenario.
+            logger.error(f"[rank {self.moe_ep_rank}] mori shmem initialization failed: {e}")
             # Don't fail completely - mark as initialized to avoid retry loops
-            self._shmem_initialized = True
-            logger.warning(f"[rank {self.rank}] Continuing without mori shmem optimization")
+            _SHMEM_INITIALIZED = True
+            logger.warning(f"[rank {self.moe_ep_rank}] Continuing without mori shmem optimization")
 
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):

@@ -166,6 +166,8 @@ class _MoRIDispatcherImplBase:
         self,
         config: EpDispatchCombineConfig,
         moriep_mode: MoRIEPMode,
+        use_fp8_w8a8: bool = False,
+        quant_dtype: torch.dtype = torch.float8_e4m3fn,
     ):
         if not use_mori:
             raise ImportError(
@@ -174,14 +176,14 @@ class _MoRIDispatcherImplBase:
             )
         self.config = config
         self._ops_handle = EpDispatchCombineOp(config)
+        self.use_fp8_w8a8 = use_fp8_w8a8
+        self.quant_dtype = quant_dtype
     
     def dispatch(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        use_fp8_w8a8: bool = False,
-        fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+        topk_weights: torch.Tensor
     ):
         raise NotImplementedError
 
@@ -198,8 +200,10 @@ class _MoRIDispatcherImplNormal(_MoRIDispatcherImplBase):
         self,
         config: EpDispatchCombineConfig,
         moriep_mode: MoRIEPMode,
+        use_fp8_w8a8: bool = False,
+        quant_dtype: torch.dtype = torch.float8_e4m3fn,
     ):
-        super().__init__(config, moriep_mode)
+        super().__init__(config, moriep_mode, use_fp8_w8a8, quant_dtype)
     
     def dispatch(
         self,
@@ -222,30 +226,30 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
         self,
         config: EpDispatchCombineConfig,
         moriep_mode: MoRIEPMode,
+        use_fp8_w8a8: bool = False,
+        quant_dtype: torch.dtype = torch.float8_e4m3fn,
+
     ):
-        super().__init__(config, moriep_mode)
+        super().__init__(config, moriep_mode, use_fp8_w8a8, quant_dtype)
 
     def dispatch(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        use_fp8_w8a8: bool = False,
-        fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+        topk_weights: torch.Tensor
     ):
         topk_idx = topk_idx.to(torch.int64)
         scales = None
-        if use_fp8_w8a8:
+        if self.use_fp8_w8a8:
             from aiter import (
                 get_hip_quant,
-                QuantType,
+                QuantType
             )
-            quant_dtype = fp8_dtype
             quant_type = QuantType.per_128x128
             quant_func = get_hip_quant(quant_type)
             hidden_states, scales = quant_func(
                 hidden_states,
-                quant_dtype=quant_dtype,
+                quant_dtype=self.quant_dtype,
             )            
             
         (
@@ -283,7 +287,7 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
         if use_fp8_w8a8 or _use_aiter:
             output = hidden_states
         else:
-            raise RuntimeError(f"We currently supports aiter kernel only.")
+            raise NotImplementedError(f"Currently, only aiter kernel is supported.")
 
         try:
             hidden_states, combined_weights = self._ops_handle.combine(
@@ -378,12 +382,16 @@ class MoRIDispatcher(BaseDispatcher):
         if self.moriep_mode.enable_normal():
             self._normal_dispatcher = _MoRIDispatcherImplNormal(
                 self.config,
-                self.moriep_mode
+                self.moriep_mode,
+                self.use_fp8_w8a8,
+                self.quant_dtype
             )
         if self.moriep_mode.enable_low_latency():
             self._low_latency_dispatcher = _MoRIDispatcherImplLowLatency(
                 self.config,
-                self.moriep_mode
+                self.moriep_mode,
+                self.use_fp8_w8a8,
+                self.quant_dtype
             )
         logger.debug(
             f"[rank:{self.rank}] mori dispatcher created with configs: "
@@ -458,9 +466,7 @@ class MoRIDispatcher(BaseDispatcher):
         ret = self._get_impl().dispatch(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            use_fp8_w8a8=self.use_fp8_w8a8,
-            quant_dtype=self.quant_dtype,
+            topk_weights=topk_weights
         )
         return ret
     
@@ -475,8 +481,7 @@ class MoRIDispatcher(BaseDispatcher):
         ret = self._get_impl(forward_batch).combine(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            use_fp8_w8a8=self.use_fp8_w8a8,
+            topk_weights=topk_weights
         )
         return ret
         
