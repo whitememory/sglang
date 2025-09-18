@@ -454,7 +454,6 @@ class DeepEPMoE(EPMoE):
 
         if _use_aiter:
             assert DispatchOutputChecker.format_is_deepep(dispatch_output)
-            assert DispatchOutputChecker.format_is_mori(dispatch_output)
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
             return self.forward_aiter(dispatch_output)
         if _is_npu:
@@ -833,6 +832,8 @@ class MoRIEPMoE(EPMoE):
             num_local_experts=self.num_local_experts,
             hidden_size=hidden_size,
             params_dtype=params_dtype,
+            use_fp8_w8a8=self.use_fp8_w8a8,
+            quant_dtype=self.fp8_dtype,
             mori_mode=self.mori_mode,
             async_finish=True,  # TODO
             return_recv_hook=True,
@@ -895,7 +896,7 @@ class MoRIEPMoE(EPMoE):
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        return self.deepep_dispatcher.dispatch(
+        return self.mori_dispatcher.dispatch(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
@@ -910,8 +911,9 @@ class MoRIEPMoE(EPMoE):
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
             return self.forward_aiter(dispatch_output)
         else:
-            raise ValueError(
-                f"Dispatch output format {dispatch_output.format} is not supported"
+            raise NotImplementedError(
+                #f"Dispatch output format {dispatch_output.format} is not supported"
+                f"Currently, only aiter is supported."
             )
     
     def combine(
@@ -962,7 +964,7 @@ class MoRIEPMoE(EPMoE):
             expert_mask=self.expert_mask,
         )
     
-    # NOTE: Copy from vLLM
+    # NOTE: Copy from ihbang's vLLM-mori impl PR
     def _ensure_shmem_initialized(self):
         """Ensure mori's shared memory system is initialized (lazy initialization)"""
         if self._shmem_initialized:

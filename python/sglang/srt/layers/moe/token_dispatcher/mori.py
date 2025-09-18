@@ -23,6 +23,7 @@ from sglang.srt.utils import (
     is_npu,
     load_json_config,
 )
+import torch
 _is_npu = is_npu()
 
 # TODO: 
@@ -60,6 +61,8 @@ logger = logging.getLogger(__name__)
 
 # --------------------------- MoRI Dispatch Output ---------------------------------
 # TODO: Change the output format to meet MoRI Dispatch output
+# * [ ] MoRINormalOutput
+# * [V] MoRILLOutput
 
 class MoRINormalOutput(NamedTuple):
     """MoRI normal dispatch output."""
@@ -77,11 +80,11 @@ class MoRINormalOutput(NamedTuple):
 class MoRILLOutput(NamedTuple):
     """MoRI low latency dispatch output."""
 
-    hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor]
+    hidden_states: torch.Tensor | Tuple[torch.Tensor, torch.Tensor]
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
-    masked_m: torch.Tensor
-    expected_m: int
+    scales: torch.Tensor
+    num_recv_tokens_per_expert: List[int] 
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -177,6 +180,8 @@ class _MoRIDispatcherImplBase:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        use_fp8_w8a8: bool = False,
+        fp8_dtype: torch.dtype = torch.float8_e4m3fn,
     ):
         raise NotImplementedError
 
@@ -202,15 +207,15 @@ class _MoRIDispatcherImplNormal(_MoRIDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        pass
+        raise NotImplementedError("mori normal mode is currently not supported.")
     
-    def conbine(
+    def combine(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        pass
+        raise NotImplementedError("mori normal mode is currently not supported.")
 
 class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
     def __init__(
@@ -219,23 +224,79 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
         moriep_mode: MoRIEPMode,
     ):
         super().__init__(config, moriep_mode)
-        
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        use_fp8_w8a8: bool = False,
+        fp8_dtype: torch.dtype = torch.float8_e4m3fn,
     ):
-        pass
+        topk_idx = topk_idx.to(torch.int64)
+        scales = None
+        if use_fp8_w8a8:
+            from aiter import (
+                get_hip_quant,
+                QuantType,
+            )
+            quant_dtype = fp8_dtype
+            quant_type = QuantType.per_128x128
+            quant_func = get_hip_quant(quant_type)
+            hidden_states, scales = quant_func(
+                hidden_states,
+                quant_dtype=quant_dtype,
+            )            
+            
+        (
+            dispatch_output,
+            dispatch_weights,
+            dispatch_scales,
+            dispatch_indices,
+            dispatch_recv_num_token,
+        ) = self._ops_handle.dispatch(
+            input=hidden_states,
+            weights=topk_weights,
+            scales=scales,
+            indicies=topk_idx
+        )
     
-    def conbine(
+        return MoRILLOutput(
+            hidden_states=dispatch_output, 
+            topk_idx=dispatch_indices,
+            topk_weights=dispatch_weights,
+            scales=dispatch_scales,
+            num_recv_tokens_per_expert=dispatch_recv_num_token
+        )
+    
+    def combine(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        use_fp8_w8a8: bool = False,
     ):
-        pass
+        # NOTE: Question: Does combine process not need original number of tokens?
+        #       I can't find any reorder and slicing procedure to get original-sized 
+        #       'hidden_states' with using aiter.
+        
+        if use_fp8_w8a8 or _use_aiter:
+            output = hidden_states
+        else:
+            raise RuntimeError(f"We currently supports aiter kernel only.")
 
+        try:
+            hidden_states, combined_weights = self._ops_handle.combine(
+                input=hidden_states,
+                weights=topk_weights,
+                indices=topk_idx,
+            )
+            
+            return hidden_states
+
+        except Exception as e:
+            logger.error(f"mori combine failed: {e}")
+            raise RuntimeError(f"mori combine failed: {e}") from e
 
 
 # TODO: should Implement MORI dispatcher, below is nonsense code for removal
@@ -251,6 +312,8 @@ class MoRIDispatcher(BaseDispatcher):
         num_local_experts: int = None,
         hidden_size: int = None,
         params_dtype: torch.dtype = None,
+        use_fp8_w8a8: bool = False,
+        quant_dtype: torch.dtype = torch.float8_e4m3fn,
         moriep_mode: MoRIEPMode = MoRIEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
@@ -275,6 +338,8 @@ class MoRIDispatcher(BaseDispatcher):
         )
 
         self.group = group # We may need change the group to _EP_MOE
+        self.use_fp8_w8a8 = use_fp8_w8a8
+        self.quant_dtype = quant_dtype
         self._internode = False
         assert (
             dist.get_backend(group) != dist.Backend.NCCL
@@ -368,8 +433,8 @@ class MoRIDispatcher(BaseDispatcher):
             max_token_type_size=max_token_type_size,
 
             # Quantization support (disabled for now)
-            scale_dim=0,
-            scale_type_size=0,
+            scale_dim=scale_dim,
+            scale_type_size=scale_type_size,
 
             # Use internal buffer management
             use_external_inp_buf=False,
@@ -394,11 +459,13 @@ class MoRIDispatcher(BaseDispatcher):
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
+            use_fp8_w8a8=self.use_fp8_w8a8,
+            quant_dtype=self.quant_dtype,
         )
         return ret
     
     #def conbine(self, *args, **kwargs) -> Tuple:
-    def conbine(
+    def combine(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
@@ -409,6 +476,7 @@ class MoRIDispatcher(BaseDispatcher):
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
+            use_fp8_w8a8=self.use_fp8_w8a8,
         )
         return ret
         
