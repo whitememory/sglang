@@ -14,7 +14,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.utils import DeepEPMode, get_deepep_config, is_tbo_enabled
+from sglang.srt.layers.moe.utils import MoRIEPMode, get_deepep_config, is_tbo_enabled
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -29,16 +29,22 @@ _is_npu = is_npu()
 # 1. Find subsitution of deep_ep Buffer and Config
 # 2. Change the deep_ep conditions into mori_ep conditions
 try: 
-    from mori.ops.dispatch_combine import EpDispatchCombineConfig, EpDispatchCombineOp, EpDispatchCombineKernelType
+    from mori.ops.dispatch_combine import (
+        EpDispatchCombineConfig, 
+        EpDispatchCombineOp, 
+        EpDispatchCombineKernelType,
+    )
     
+    # NOTE: Could we need to support 'npu' devices?
     if not _is_npu:
         from sglang.srt.layers.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
 
-    use_deepep = True
+    use_mori = True
 except ImportError:
-    use_deepep = False
+    use_mori = False
+
 
 from enum import Enum, IntEnum, auto
 
@@ -66,7 +72,7 @@ class MoRINormalOutput(NamedTuple):
 
     @property
     def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.MORIEP_NORMAL
+        return DispatchOutputFormat.MORI_NORMAL
     
 class MoRILLOutput(NamedTuple):
     """MoRI low latency dispatch output."""
@@ -79,7 +85,7 @@ class MoRILLOutput(NamedTuple):
 
     @property
     def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.MORIEP_LL
+        return DispatchOutputFormat.MORI_LL
 
 assert isinstance(MoRINormalOutput, DispatchOutput)
 assert isinstance(MoRILLOutput, DispatchOutput)
@@ -95,7 +101,7 @@ class MoRINormalCombineInput(NamedTuple):
 
     @property
     def format(self) -> CombineInputFormat:
-        return CombineInputFormat.MORIEP_NORMAL
+        return CombineInputFormat.MORI_NORMAL
     
 class MoRILLCombineInput(NamedTuple):
     """MoRI low latency combine input."""
@@ -104,7 +110,7 @@ class MoRILLCombineInput(NamedTuple):
 
     @property
     def format(self) -> CombineInputFormat:
-        return CombineInputFormat.MORIEP_LL
+        return CombineInputFormat.MORI_LL
 
 assert isinstance(MoRINormalCombineInput, CombineInput)
 assert isinstance(MoRILLCombineInput, CombineInput)
@@ -123,16 +129,112 @@ class MoRIBuffer:
 #       actual implementation should be done inside of MoRIDispatcher
 class MoRIConfig(BaseDispatcherConfig):
     pass
+       
         
+"""
+NOTE & TODO:
+We should modify the interface of dispatch & combine following the mori's.
+Check the below function interface.
 
+def dispatch(
+    self,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    indices: torch.Tensor,
+    block_num: int = -1,
+    warp_per_block: int = -1,
+):
+    ...
+
+def combine(
+    self,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    indices: torch.Tensor,
+    block_num: int = -1,
+    warp_per_block: int = -1,
+    call_reset: bool = True,
+):
+    ...
+"""
 class _MoRIDispatcherImplBase:
-    pass
+    def __init__(
+        self,
+        config: EpDispatchCombineConfig,
+        moriep_mode: MoRIEPMode,
+    ):
+        if not use_mori:
+            raise ImportError(
+                "MoRI is not installed. Pleas install MoRI package from "
+                "https://github.com/ROCm/mori."
+            )
+        self.config = config
+        self._ops_handle = EpDispatchCombineOp(config)
+    
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        raise NotImplementedError
+
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        raise NotImplementedError
 
 class _MoRIDispatcherImplNormal(_MoRIDispatcherImplBase):
-    pass
+    def __init__(
+        self,
+        config: EpDispatchCombineConfig,
+        moriep_mode: MoRIEPMode,
+    ):
+        super().__init__(config, moriep_mode)
+    
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        pass
+    
+    def conbine(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        pass
 
 class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
-    pass
+    def __init__(
+        self,
+        config: EpDispatchCombineConfig,
+        moriep_mode: MoRIEPMode,
+    ):
+        super().__init__(config, moriep_mode)
+        
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        pass
+    
+    def conbine(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        pass
 
 
 
@@ -149,10 +251,16 @@ class MoRIDispatcher(BaseDispatcher):
         num_local_experts: int = None,
         hidden_size: int = None,
         params_dtype: torch.dtype = None,
-        # deepep_mode: DeepEPMode = DeepEPMode.AUTO,
+        moriep_mode: MoRIEPMode = MoRIEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
+        if not use_mori:
+            raise ImportError(
+                "MoRI is not installed. Pleas install MoRI package from "
+                "https://github.com/ROCm/mori."
+            )
+        
         # TODO: Clean the unused APIs
         from sglang.srt.distributed.parallel_state import (
             get_tensor_model_parallel_rank,
@@ -195,8 +303,31 @@ class MoRIDispatcher(BaseDispatcher):
             num_experts_per_token=router_topk,
         )
         
-        pass
-
+        # NOTE:
+        # 1. mori does not use recv hook like deepep. So there is no distinguish 
+        #    of each stages
+        # 2. Currently, mori has low-latency mode only but high-throughput 
+        #    mode will be added later. So, the 'normal' mode should be change 
+        #    to 'ht' (high-throughput) mode in the future.
+        self.moriep_mode = moriep_mode
+        if self.moriep_mode.enable_normal():
+            self._normal_dispatcher = _MoRIDispatcherImplNormal(
+                self.config,
+                self.moriep_mode
+            )
+        if self.moriep_mode.enable_low_latency():
+            self._low_latency_dispatcher = _MoRIDispatcherImplLowLatency(
+                self.config,
+                self.moriep_mode
+            )
+        logger.debug(
+            f"[rank:{self.rank}] mori dispatcher created with configs: "
+            f"max_num_tokens={self.max_dispatch_tokens_per_rank}, "
+            f"num_local_experts={num_local_experts}, "
+            f"num_experts_per_token={router_topk}, "
+            f"hidden_size={hidden_size}"
+        )
+        
     # NOTE: Moved to MoRIEPMoE class
     # def _init_mori_shmem():
     #     pass
@@ -250,4 +381,47 @@ class MoRIDispatcher(BaseDispatcher):
         )
 
         return config
+          
+    #def dispatch(self, *args, **kwargs) -> DispatchOutput:
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> DispatchOutput:
+        ret = self._get_impl().dispatch(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+        )
+        return ret
+    
+    #def conbine(self, *args, **kwargs) -> Tuple:
+    def conbine(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple:
+        ret = self._get_impl(forward_batch).combine(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+        )
+        return ret
+        
+    def _get_impl(self, forward_batch: ForwardBatch) -> _MoRIDispatcherImplBase:
+        resolved_moriep_mode = self.moriep_mode.resolve(
+            forward_batch.is_extend_in_batch
+        )
+        if resolved_moriep_mode == MoRIEPMode.NORMAL:
+            return self._normal_dispatcher
+        elif resolved_moriep_mode == MoRIEPMode.LOW_LATENCY:
+            return self._low_latency_dispatcher
+        else:
+            raise ValueError(f"Invalid moriep_mode: {self.moriep_mode}")
+    
+    
     
