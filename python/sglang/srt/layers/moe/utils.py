@@ -203,7 +203,7 @@ def get_deepep_config() -> str:
     return DEEPEP_CONFIG
 
 
-def get_mori_mode() -> MoRIEPMode:
+def get_moriep_mode() -> MoRIEPMode:
     global MORIEP_MODE
     if MORIEP_MODE is None:
         logger.warning("MORIEP_MODE is not initialized, using auto mode")

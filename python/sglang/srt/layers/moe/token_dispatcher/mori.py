@@ -189,6 +189,7 @@ class _MoRIDispatcherImplBase:
 
     def combine(
         self,
+        output: torch.Tensor,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -215,6 +216,7 @@ class _MoRIDispatcherImplNormal(_MoRIDispatcherImplBase):
     
     def combine(
         self,
+        output: torch.Tensor,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -275,6 +277,7 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
     
     def combine(
         self,
+        output: torch.Tensor,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -284,10 +287,7 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
         #       I can't find any reorder and slicing procedure to get original-sized 
         #       'hidden_states' with using aiter.
         
-        if use_fp8_w8a8 or _use_aiter:
-            output = hidden_states
-        else:
-            raise NotImplementedError(f"Currently, only aiter kernel is supported.")
+        num_original_tokens = output.size(0)  # Original number of tokens
 
         try:
             hidden_states, combined_weights = self._ops_handle.combine(
@@ -295,8 +295,12 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
                 weights=topk_weights,
                 indices=topk_idx,
             )
-            
-            return hidden_states
+
+            output.copy_(
+                hidden_states[:num_original_tokens], non_blocking=True
+            )
+            # In this case, return not needed. 
+            # return output
 
         except Exception as e:
             logger.error(f"mori combine failed: {e}")
@@ -473,12 +477,14 @@ class MoRIDispatcher(BaseDispatcher):
     #def conbine(self, *args, **kwargs) -> Tuple:
     def combine(
         self,
+        output: torch.Tensor,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Tuple:
         ret = self._get_impl(forward_batch).combine(
+            output,
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights

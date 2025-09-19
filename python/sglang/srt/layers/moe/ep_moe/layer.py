@@ -12,7 +12,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.layers.moe import (
     get_deepep_mode,
-    get_mori_mode,
+    get_moriep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
     should_use_flashinfer_trtllm_moe,
@@ -822,7 +822,7 @@ class MoRIEPMoE(EPMoE):
             activation=activation,
             routed_scaling_factor=routed_scaling_factor,
         )
-        self.mori_mode = get_mori_mode()
+        self.moriep_mode = get_moriep_mode()
         
         # TODO: move to the beginning of the file
         from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
@@ -838,9 +838,9 @@ class MoRIEPMoE(EPMoE):
             params_dtype=params_dtype,
             use_fp8_w8a8=self.use_fp8_w8a8,
             quant_dtype=self.fp8_dtype,
-            mori_mode=self.mori_mode,
+            mori_mode=self.moriep_mode,
             async_finish=True,  # TODO
-            return_recv_hook=True,
+            return_recv_hook=False, # Currently, not used
         )
 
         if _use_aiter:
@@ -881,17 +881,19 @@ class MoRIEPMoE(EPMoE):
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        output =  torch.zeros_like(hidden_states)
         dispatch_output = self.dispatch(
             hidden_states, topk_idx, topk_weights, forward_batch
         )
         hidden_states = self.moe_impl(dispatch_output)
-        hidden_states = self.combine(
+        self.combine(
+            output,
             hidden_states,
             dispatch_output.topk_idx,
             dispatch_output.topk_weights,
             forward_batch,
         )
-        return hidden_states
+        return output
 
     def dispatch(
         self,
@@ -919,12 +921,14 @@ class MoRIEPMoE(EPMoE):
     
     def combine(
         self,
+        output: torch.Tensor,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
         return self.mori_dispatcher.combine(
+            output,
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
