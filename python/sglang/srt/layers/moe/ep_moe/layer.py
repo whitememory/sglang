@@ -6,8 +6,9 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 
 from sglang.srt.distributed.parallel_state import (
-    get_moe_expert_parallel_world_size, 
-    _MOE_EP,
+    get_moe_expert_parallel_world_size,
+    get_world_group,
+    get_moe_ep_group, 
 )
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -824,7 +825,6 @@ class MoRIEPMoE(EPMoE):
         self.mori_mode = get_mori_mode()
         
         # TODO: move to the beginning of the file
-        from sglang.srt.distributed.parallel_state import get_tp_group, get_moe_ep_group
         from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
         
         self._ensure_shmem_initialized()
@@ -969,6 +969,10 @@ class MoRIEPMoE(EPMoE):
     # TODO: We should test this function later.
     def _ensure_shmem_initialized(self):
         """Ensure mori's shared memory system is initialized (lazy initialization)"""
+        global _SHMEM_INITIALIZED
+        ep_group = get_moe_ep_group()
+        world_group = get_world_group()
+
         if _SHMEM_INITIALIZED:
             return
 
@@ -986,10 +990,10 @@ class MoRIEPMoE(EPMoE):
                 raise RuntimeError("No valid distributed backend found")
             
             logger.debug(f"[rank {self.moe_ep_rank}] PyTorch distributed ready with backend: {backend}")
+            # Actually, dist must be initialized to reach here. check init_distributed_environment() at parallel_state.py
+            current_group = ep_group.cpu_group if ep_group.cpu_group is not None else world_group.cpu_group
 
-            current_group = _MOE_EP.cpu_group if _MOE_EP.cpu_group is not None else dist.group.WORLD
-
-            # TODO(inhyeok): make group_name more reasonable
+            # TODO FIXME: why do we register new group and use it to initialize shmem?
             group_name = "default"
             try:
                 import torch._C._distributed_c10d as c10d
