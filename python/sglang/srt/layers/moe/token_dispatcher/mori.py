@@ -24,6 +24,7 @@ from sglang.srt.utils import (
     load_json_config,
 )
 import torch
+import aiter
 _is_npu = is_npu()
 
 # TODO: 
@@ -240,18 +241,21 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor
     ):
-        topk_idx = topk_idx.to(torch.int64)
+        # topk_idx = topk_idx.to(torch.int64)
         scales = None
-        if self.use_fp8_w8a8:
+        # if self.use_fp8_w8a8:
+        if False:
             from aiter import (
                 get_hip_quant,
                 QuantType
             )
-            quant_type = QuantType.per_128x128
+            #quant_type = QuantType.per_128x128 # 128x128 not supported
+            quant_type = QuantType.per_1x128
             quant_func = get_hip_quant(quant_type)
             hidden_states, scales = quant_func(
                 hidden_states,
-                quant_dtype=self.quant_dtype,
+                # quant_dtype=self.quant_dtype,
+                quant_dtype=aiter.dtypes.fp8,
             )            
             
         (
@@ -264,8 +268,10 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
             input=hidden_states,
             weights=topk_weights,
             scales=scales,
-            indicies=topk_idx
+            indices=topk_idx
         )
+        print(  f"[GW DEBUG] {hidden_states=}, {topk_weights=}, {topk_idx=}, "
+                f"{scales=}, {dispatch_scales=}")
     
         return MoRILLOutput(
             hidden_states=dispatch_output, 
@@ -287,18 +293,22 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
         #       I can't find any reorder and slicing procedure to get original-sized 
         #       'hidden_states' with using aiter.
         
-        num_original_tokens = output.size(0)  # Original number of tokens
+        
+        # num_original_tokens = output.size(0)  # Original number of tokens
+        num_original_tokens = output.shape[0]  # Original number of tokens
 
         try:
+            print(f"[GW DEBUG] {hidden_states=}, {hidden_states.shape}, {topk_weights=}, {topk_idx=}")
             hidden_states, combined_weights = self._ops_handle.combine(
                 input=hidden_states,
                 weights=topk_weights,
                 indices=topk_idx,
             )
-
+            # print(f"[GW_DEBUG] {output.shape=}, {hidden_states.shape=}, {num_original_tokens=}")
             output.copy_(
                 hidden_states[:num_original_tokens], non_blocking=True
             )
+            # print(f"[GW DEBUG] {output=}, {hidden_states=}, token_num_on_this_rank: {self._ops_handle._get_cur_rank_num_token(self._ops_handle._handle)}")
             # In this case, return not needed. 
             # return output
 
@@ -306,6 +316,7 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
             logger.error(f"mori combine failed: {e}")
             raise RuntimeError(f"mori combine failed: {e}") from e
 
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 # TODO: should Implement MORI dispatcher, below is nonsense code for removal
 # NOTE: to implement TBO with MoRI, first use same function name and logic flow
@@ -313,7 +324,8 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
 class MoRIDispatcher(BaseDispatcher):   
     def __init__(
         self,
-        group: torch.distributed.ProcessGroup,
+        #group: torch.distributed.ProcessGroup,
+        group: GroupCoordinator,
         router_topk: int,
         permute_fusion: bool = False,
         num_experts: int = None,
@@ -345,14 +357,15 @@ class MoRIDispatcher(BaseDispatcher):
             is_dp_attention_enabled,
         )
 
-        self.group = group # We may need change the group to _EP_MOE
+        self.group = group.device_group # We may need change the group to _EP_MOE
         self.use_fp8_w8a8 = use_fp8_w8a8
         self.quant_dtype = quant_dtype
         self._internode = False
         assert (
-            dist.get_backend(group) != dist.Backend.NCCL
-        ), f"NCCL backend not support inter-node communication"
-        if not all(in_the_same_node_as(group, source_rank=0)):
+            dist.get_backend(group.cpu_group) != dist.Backend.NCCL
+            ),  f"NCCL backend not support inter-node communication. " \
+                f"backend: {dist.get_backend(group.cpu_group)}"
+        if not all(in_the_same_node_as(group.cpu_group, source_rank=0)):
             self._internode = True          
 
         self.rank = (
@@ -399,7 +412,7 @@ class MoRIDispatcher(BaseDispatcher):
             )
         logger.debug(
             f"[rank:{self.rank}] mori dispatcher created with configs: "
-            f"max_num_tokens={self.max_dispatch_tokens_per_rank}, "
+            f"max_num_tokens={self.num_max_dispatch_tokens_per_rank}, "
             f"num_local_experts={num_local_experts}, "
             f"num_experts_per_token={router_topk}, "
             f"hidden_size={hidden_size}"
@@ -411,13 +424,13 @@ class MoRIDispatcher(BaseDispatcher):
     
     def _make_mori_config(
         self,
-        data_type: torch.dtype = torch.bfloat16,
         hidden_dim: int,
         rank: int,
         world_size: int,
         max_num_tokens: int,
         num_experts_per_rank: int,
         num_experts_per_token: int,
+        data_type: torch.dtype = torch.bfloat16,
         scale_dim: int = 0,
         scale_type_size: int = 0,        
     ):
@@ -430,6 +443,7 @@ class MoRIDispatcher(BaseDispatcher):
         }
         max_token_type_size = dtype_to_size.get(data_type, 2)
 
+        _scale_type_size = torch.float32.itemsize
         config = EpDispatchCombineConfig(
             data_type=data_type,
             rank=rank,
@@ -447,6 +461,8 @@ class MoRIDispatcher(BaseDispatcher):
             # Quantization support (disabled for now)
             scale_dim=scale_dim,
             scale_type_size=scale_type_size,
+            # scale_dim=32, # GW: TEMP
+            # scale_type_size=_scale_type_size,
 
             # Use internal buffer management
             use_external_inp_buf=False,
@@ -467,7 +483,7 @@ class MoRIDispatcher(BaseDispatcher):
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> DispatchOutput:
-        ret = self._get_impl().dispatch(
+        ret = self._get_impl(forward_batch).dispatch(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights
@@ -501,6 +517,5 @@ class MoRIDispatcher(BaseDispatcher):
             return self._low_latency_dispatcher
         else:
             raise ValueError(f"Invalid moriep_mode: {self.moriep_mode}")
-    
     
     

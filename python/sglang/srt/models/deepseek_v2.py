@@ -198,6 +198,7 @@ class AttnForwardMethod(IntEnum):
 
 
 class DeepseekV2MLP(nn.Module):
+    layer_id = 0 # NOTE: DEBUG
     def __init__(
         self,
         hidden_size: int,
@@ -238,6 +239,7 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
+
     def forward(
         self,
         x,
@@ -246,21 +248,71 @@ class DeepseekV2MLP(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ):
+        from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
-        if gemm_output_zero_allocator != None and x.shape[0] <= 256:
-            y = gemm_output_zero_allocator.allocate(
-                x.shape[0] * self.gate_up_proj.output_size_per_partition
-            ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
-            x = (x, None, y)
+        _backend_name = ""
+        if get_moe_a2a_backend().is_mori():
+            _backend_name = "mori/"
+        else:
+            _backend_name = "naive/"
+        _dir = f"/sgl-workspace/log_dir/" + _backend_name + "shared_expert/"
+        _file_name = f"rank_{get_tensor_model_parallel_rank()}"
+        file_path = _dir + _file_name
+        try:
+            with open(file_path, 'a', encoding='utf-8') as f:
+                f.write(f"layer_{self.layer_id}\n")
+                f.write(f"Initial hidden state: {x}, {x.shape}\n")
 
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
-        )
-        return x
+                if gemm_output_zero_allocator != None and x.shape[0] <= 256:
+                    y = gemm_output_zero_allocator.allocate(
+                        x.shape[0] * self.gate_up_proj.output_size_per_partition
+                    ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
+                    x = (x, None, y)
+
+                gate_up, _ = self.gate_up_proj(x)
+                x = self.act_fn(gate_up)
+                x, _ = self.down_proj(
+                    x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+                )
+
+                f.write(f"After up_proj: {x}, {x.shape}\n\n")
+                self._next_layer_id()
+                return x
+        except IOError as e:
+            raise IOError(f"IO error occured while writing on {file_path}")
+
+    @classmethod
+    def _next_layer_id(cls):
+        cls.layer_id += 1
+
+
+
+    # NOTE: original
+    # def forward(
+    #     self,
+    #     x,
+    #     forward_batch=None,
+    #     should_allreduce_fusion: bool = False,
+    #     use_reduce_scatter: bool = False,
+    #     gemm_output_zero_allocator: BumpAllocator = None,
+    # ):
+    #     if (self.tp_size == 1) and x.shape[0] == 0:
+    #         return x
+
+    #     if gemm_output_zero_allocator != None and x.shape[0] <= 256:
+    #         y = gemm_output_zero_allocator.allocate(
+    #             x.shape[0] * self.gate_up_proj.output_size_per_partition
+    #         ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
+    #         x = (x, None, y)
+
+    #     gate_up, _ = self.gate_up_proj(x)
+    #     x = self.act_fn(gate_up)
+    #     x, _ = self.down_proj(
+    #         x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+    #     )
+    #     return x
 
 
 class MoEGate(nn.Module):
@@ -402,6 +454,7 @@ class DeepseekV2MoE(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()  # TODO: dense(no tp) for shared_expert for mori too?
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    or get_moe_a2a_backend().is_mori()
                     else {}
                 ),
             )
@@ -462,6 +515,8 @@ class DeepseekV2MoE(nn.Module):
             )
 
         self._enable_deepep_moe = get_moe_a2a_backend().is_deepep()
+        self._enable_moriep_moe = get_moe_a2a_backend().is_mori()
+#         print(f"{self._enable_moriep_moe=}")
 
     def get_moe_weights(self):
         return [
@@ -478,7 +533,7 @@ class DeepseekV2MoE(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
-        if not self._enable_deepep_moe:
+        if not (self._enable_deepep_moe or self._enable_moriep_moe):
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
             if (
                 self.alt_stream is not None

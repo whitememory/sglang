@@ -281,6 +281,7 @@ class ServerArgs:
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
+    moriep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
@@ -1616,6 +1617,13 @@ class ServerArgs:
             choices=["normal", "low_latency", "auto"],
             default="auto",
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+        )
+        parser.add_argument(
+            "--moriep-mode",
+            type=str,
+            choices=["normal", "low_latency", "auto"],
+            default="auto",
+            help="Select the mode when enable MoRIEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. Currently, 'low_latency' is supported.",
         )
         parser.add_argument(
             "--ep-num-redundant-experts",

@@ -13,6 +13,7 @@ from sglang.srt.distributed import (
     get_moe_tensor_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
+    get_tensor_model_parallel_rank, # NOTE: DEBUG
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -830,26 +831,71 @@ class FusedMoE(torch.nn.Module):
             elif TopKOutputChecker.format_is_triton_kernel(topk_output):
                 raise NotImplementedError()
 
-        dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
-        )
+        _dir = f"/sgl-workspace/log_dir/naive/sparse_expert"
+        _file_name = f"rank_{get_tensor_model_parallel_rank()}"
+        file_path = _dir + _file_name
+        try:
+            with open(file_path, 'a', encoding='utf-8') as f:
+                f.write(f"layer_{self.layer_id}\n")
+                f.write(f"After attention: {hidden_states}, {hidden_states.shape}\n")
+                dispatch_output = self.dispatcher.dispatch(
+                    hidden_states=hidden_states, topk_output=topk_output
+                )
+                f.write(f"After dispatch: {dispatch_output.hidden_states}, {dispatch_output.hidden_states.shape}\n")
+                combine_input = self.quant_method.apply(
+                    layer=self,
+                    dispatch_output=dispatch_output,
+                )
+                f.write(f"After fmoe: {combine_input.hidden_states}, {combine_input.hidden_states.shape}\n")
+                final_hidden_states = self.dispatcher.combine(combine_input)
+                final_hidden_states = final_hidden_states[
+                    ..., :origin_hidden_states_dim
+                ].contiguous()
+                if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
+                    final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+                f.write(f"After combine: {final_hidden_states}, {final_hidden_states.shape}\n\n")
+                return final_hidden_states
+        except IOError as e:
+            raise IOError(f"IO error occured while writing on {file_path}")
 
-        # TODO: consider using symmetric memory
-        combine_input = self.quant_method.apply(
-            layer=self,
-            dispatch_output=dispatch_output,
-        )
+    # NOTE: Original
+    # def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    #     origin_hidden_states_dim = hidden_states.shape[-1]
+    #     assert self.quant_method is not None
 
-        final_hidden_states = self.dispatcher.combine(combine_input)
+    #     if self.moe_ep_size > 1 and not self.enable_flashinfer_cutlass_moe:
+    #         if self.expert_map_cpu is not None and self.expert_map_gpu is None:
+    #             # If we are in EP mode, we need to move the expert map to GPU.
+    #             self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
 
-        final_hidden_states = final_hidden_states[
-            ..., :origin_hidden_states_dim
-        ].contiguous()
+    #     if self.expert_map_gpu is not None:
+    #         if TopKOutputChecker.format_is_standard(topk_output):
+    #             topk_output = topk_output._replace(
+    #                 topk_ids=self.expert_map_gpu[topk_output.topk_ids]
+    #             )
+    #         elif TopKOutputChecker.format_is_triton_kernel(topk_output):
+    #             raise NotImplementedError()
 
-        if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+    #     dispatch_output = self.dispatcher.dispatch(
+    #         hidden_states=hidden_states, topk_output=topk_output
+    #     )
 
-        return final_hidden_states
+    #     # TODO: consider using symmetric memory
+    #     combine_input = self.quant_method.apply(
+    #         layer=self,
+    #         dispatch_output=dispatch_output,
+    #     )
+
+    #     final_hidden_states = self.dispatcher.combine(combine_input)
+
+    #     final_hidden_states = final_hidden_states[
+    #         ..., :origin_hidden_states_dim
+    #     ].contiguous()
+
+    #     if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
+    #         final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+    #     return final_hidden_states
 
     @classmethod
     def make_expert_params_mapping(

@@ -9,6 +9,7 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_world_group,
     get_moe_ep_group, 
+    get_tensor_model_parallel_rank, # NOTE: DEBUG
 )
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -57,6 +58,7 @@ if not (_is_npu or _is_hip):
     from sgl_kernel import silu_and_mul
 
 if _use_aiter:
+    import aiter
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
 
@@ -829,7 +831,7 @@ class MoRIEPMoE(EPMoE):
         
         self._ensure_shmem_initialized()
         self.mori_dispatcher = MaybeTboDeepEPDispatcher(
-            group=get_moe_ep_group().device_group,
+            group=get_moe_ep_group(), # Give Coordinator
             router_topk=self.top_k,
             permute_fusion=True,
             num_experts=self.num_experts,
@@ -838,7 +840,7 @@ class MoRIEPMoE(EPMoE):
             params_dtype=params_dtype,
             use_fp8_w8a8=self.use_fp8_w8a8,
             quant_dtype=self.fp8_dtype,
-            mori_mode=self.moriep_mode,
+            moriep_mode=self.moriep_mode,
             async_finish=True,  # TODO
             return_recv_hook=False, # Currently, not used
         )
@@ -881,19 +883,58 @@ class MoRIEPMoE(EPMoE):
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        output =  torch.zeros_like(hidden_states)
-        dispatch_output = self.dispatch(
-            hidden_states, topk_idx, topk_weights, forward_batch
-        )
-        hidden_states = self.moe_impl(dispatch_output)
-        self.combine(
-            output,
-            hidden_states,
-            dispatch_output.topk_idx,
-            dispatch_output.topk_weights,
-            forward_batch,
-        )
-        return output
+        _dir = f"/sgl-workspace/log_dir/mori/sparse_expert/"
+        _file_name = f"rank_{get_tensor_model_parallel_rank()}"
+        file_path = _dir + _file_name
+        try:
+            with open(file_path, 'a', encoding='utf-8') as f:
+                f.write(f"layer_{self.layer_id}\n")
+                f.write(f"After attention: {hidden_states}, {hidden_states.shape}\n")
+
+                output =  torch.zeros_like(hidden_states)
+                dispatch_output = self.dispatch(
+                    hidden_states, topk_idx, topk_weights, forward_batch
+                )
+
+                f.write(f"After dispatch: {dispatch_output.hidden_states}, {dispatch_output.hidden_states.shape}\n")
+                hidden_states = self.moe_impl(dispatch_output)
+                f.write(f"After fmoe: {hidden_states}, {hidden_states.shape}\n")
+                topk_idx = topk_idx if dispatch_output.topk_idx is None else dispatch_output.topk_idx
+                topk_weights = topk_weights if dispatch_output.topk_weights is None else dispatch_output.topk_weights
+                self.combine(
+                    output,
+                    hidden_states,
+                    topk_idx,
+                    topk_weights,
+                    forward_batch,
+                )
+                f.write(f"After combine: {output}, {output.shape}\n\n")
+                return output
+        except IOError as e:
+            raise IOError(f"IO error occured while writing on {file_path}")
+
+
+    # NOTE: original
+    # def forward(
+    #     self,
+    #     hidden_states: torch.Tensor,
+    #     topk_idx: torch.Tensor,
+    #     topk_weights: torch.Tensor,
+    #     forward_batch: ForwardBatch,
+    # ):
+    #     output =  torch.zeros_like(hidden_states)
+    #     dispatch_output = self.dispatch(
+    #         hidden_states, topk_idx, topk_weights, forward_batch
+    #     )
+    #     hidden_states = self.moe_impl(dispatch_output)
+    #     self.combine(
+    #         output,
+    #         hidden_states,
+    #         dispatch_output.topk_idx,
+    #         dispatch_output.topk_weights,
+    #         forward_batch,
+    #     )
+    #     return output
 
     def dispatch(
         self,
@@ -928,7 +969,7 @@ class MoRIEPMoE(EPMoE):
         forward_batch: ForwardBatch,
     ):
         return self.mori_dispatcher.combine(
-            output,
+            output=output,
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
@@ -939,10 +980,12 @@ class MoRIEPMoE(EPMoE):
         self,
         dispatch_output: Union[MoRINormalOutput, MoRILLOutput],
     ):
-        hidden_states, topk_idx, topk_weights = (
+        hidden_states, topk_idx, topk_weights, num_local_tokens_per_expert, scales = (
             dispatch_output.hidden_states,
             dispatch_output.topk_idx,
             dispatch_output.topk_weights,
+            dispatch_output.num_recv_tokens_per_expert,
+            dispatch_output.scales
         )
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -957,16 +1000,20 @@ class MoRIEPMoE(EPMoE):
             self.w13_weight,
             self.w2_weight,
             topk_weights,
-            topk_idx_copy,
+            topk_idx,
             w1_scale=self.w13_weight_scale_inv,
             w2_scale=self.w2_weight_scale_inv,
-            quant_type=QuantType.per_128x128,
+            a1_scale=scales,
+            num_local_tokens=num_local_tokens_per_expert,
+            # quant_type=QuantType.per_128x128,
+            quant_type=QuantType.per_1x128,
             activation=(
                 ActivationType.Silu
                 if self.moe_runner_config.activation == "silu"
                 else ActivationType.Gelu
             ),
             expert_mask=self.expert_mask,
+            dtype=aiter.dtypes.bf16
         )
     
     # NOTE: Copy from ihbang's vLLM-mori impl PR.

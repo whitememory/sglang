@@ -162,7 +162,7 @@ def initialize_moe_config(server_args: ServerArgs):
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
     DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
     DEEPEP_CONFIG = server_args.deepep_config or ""
-    MORIEP_MODE = MoRIEPMode("low_latency")
+    MORIEP_MODE = MoRIEPMode(server_args.moriep_mode) # GW: currently "low_latency" is supported
     MORIEP_CONFIG = ""
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
     TBO_TOKEN_DISTRIBUTION_THRESHOLD = server_args.tbo_token_distribution_threshold
