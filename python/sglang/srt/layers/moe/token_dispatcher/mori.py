@@ -57,6 +57,7 @@ import torch.distributed as dist
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_use_fp8_dispatch = get_bool_env_var("SGLANG_MORI_FP8_DISPATCH") and _use_aiter
 
 logger = logging.getLogger(__name__)
 
@@ -223,20 +224,24 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
         topk_weights: torch.Tensor
     ):
         scales = None
-        # if self.use_fp8_w8a8:
-        if False:
+        if self.use_fp8_w8a8 and _use_fp8_dispatch:
             from aiter import (
                 get_hip_quant,
                 QuantType
             )
-            #quant_type = QuantType.per_128x128 # 128x128 not supported
+            # quant_type = QuantType.per_128x128 # 128x128 not supported
             quant_type = QuantType.per_1x128
             quant_func = get_hip_quant(quant_type)
             hidden_states, scales = quant_func(
                 hidden_states,
                 # quant_dtype=self.quant_dtype,
                 quant_dtype=aiter.dtypes.fp8,
-            )            
+            )
+        
+        # from mori dispatch assert code
+        if scales is not None:
+            assert  (scales.is_contiguous() and scales.element_size() == self.config.scale_type_size), \
+                    f"{scales.is_contiguous()=} and {scales.element_size()=} == {self.config.scale_type_size=}"
             
         (
             dispatch_output,
@@ -306,7 +311,7 @@ class MoRIDispatcher(BaseDispatcher):
         hidden_size: int = None,
         params_dtype: torch.dtype = None,
         use_fp8_w8a8: bool = False,
-        quant_dtype: torch.dtype = torch.float8_e4m3fn,
+        quant_dtype: torch.dtype = torch.float8_e4m3fnuz,
         moriep_mode: MoRIEPMode = MoRIEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
@@ -320,7 +325,10 @@ class MoRIDispatcher(BaseDispatcher):
         # Deepep initializes params_dtype from deepseek config but we have to manually 
         # if it not works
         if params_dtype is None:
-            params_dtype = torch.bfloat16
+            if _use_fp8_dispatch and use_fp8_w8a8:
+                params_dtype = aiter.dtypes.fp8
+            else:
+                params_dtype = torch.bfloat16
         
         # TODO: Clean the unused APIs
         from sglang.srt.distributed.parallel_state import (
@@ -411,6 +419,8 @@ class MoRIDispatcher(BaseDispatcher):
             torch.float32: 4,
             torch.bfloat16: 2,
             torch.float16: 2,
+            torch.float8_e4m3fnuz: 1,
+            torch.float8_e4m3fn: 1,
         }
         max_token_type_size = dtype_to_size.get(data_type, 2)
 
@@ -429,11 +439,11 @@ class MoRIDispatcher(BaseDispatcher):
             # block_num=80,          # Good default for MI300X
             max_token_type_size=max_token_type_size,
 
-            # Quantization support (disabled for now)
-            scale_dim=scale_dim,
-            scale_type_size=scale_type_size,
-            # scale_dim=32, # GW: TEMP
-            # scale_type_size=_scale_type_size,
+            # Quantization support
+            # NOTE: scale_dim calculation from vLLM's `scale_shape` function.
+            # 56 from cdiv(hidden_dim, block_shape[-1])
+            scale_dim=56, 
+            scale_type_size=_scale_type_size, # scale from aiter uses fp32
 
             # Use internal buffer management
             # use_external_inp_buf=False,

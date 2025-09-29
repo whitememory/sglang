@@ -947,7 +947,7 @@ class MoRIEPMoE(EPMoE):
     #                 hidden_states, topk_idx, topk_weights, forward_batch
     #             )
 
-    #             f.write(f"After dispatch: {dispatch_output.hidden_states[:30, :8]=}, {dispatch_output.hidden_states.shape}, {dispatch_output.topk_idx[:30, :8]=}, {dispatch_output.topk_idx.shape}, {dispatch_output.topk_weights[:30, :8]=}, {dispatch_output.topk_weights.shape}, {dispatch_output.scales=}, {dispatch_output.num_recv_tokens_per_expert=}\n")
+    #             f.write(f"After dispatch: {dispatch_output.hidden_states[:30, :8]=}, {dispatch_output.hidden_states.shape}, {dispatch_output.topk_idx[:30, :8]=}, {dispatch_output.topk_idx.shape}, {dispatch_output.topk_weights[:30, :8]=}, {dispatch_output.topk_weights.shape}, {dispatch_output.scales[:30, :8]=}, {dispatch_output.scales.shape=} {dispatch_output.num_recv_tokens_per_expert=}\n")
     #             # if(torch.distributed.get_rank() == 0):
     #             # print(f"After dispatch: {dispatch_output.hidden_states[:30, :8]=}, {dispatch_output.hidden_states.shape}, {dispatch_output.topk_idx[:30, :8]=}, {dispatch_output.topk_idx.shape}, {dispatch_output.topk_weights[:30, :8]=}, {dispatch_output.topk_weights.shape}\n")
     #             hidden_states = self.moe_impl(dispatch_output)
@@ -1055,65 +1055,30 @@ class MoRIEPMoE(EPMoE):
         topk_idx = self._topk_idx_conversion(topk_idx)
 
         return fused_moe(
-            hidden_states,
-            self.w13_weight,
-            self.w2_weight,
-            topk_weights,
-            topk_idx,
+            hidden_states=hidden_states,
+            w1=self.w13_weight,
+            w2=self.w2_weight,
+            topk_weight=topk_weights,
+            topk_ids=topk_idx,
+            # expert_mask=self.expert_mask,
             w1_scale=self.w13_weight_scale_inv,
             w2_scale=self.w2_weight_scale_inv,
-            # a1_scale=scales,
+            a1_scale=scales,
             num_local_tokens=num_local_tokens_per_expert,
-            quant_type=QuantType.per_128x128,
-            # quant_type=QuantType.per_1x128,
+            # DSr-1 config follows per_128x128. ihbang's vLLM impl uses it.
+            # quant_type=QuantType.per_128x128, 
+            # NOTE & TODO: already 1x128 scale applied to hidden_states.
+            # Could we change the QuantType.per_1x128 ignore the DSr-1 config to 
+            # optimized fmoe execution?
+            # ANS: aiter uses the QuantType per_128x128 as per_1x128 internally.
+            # So, it doesn't matter.
+            quant_type=QuantType.per_1x128, 
             activation=(
                 ActivationType.Silu
                 if self.moe_runner_config.activation == "silu"
                 else ActivationType.Gelu
             ),
-            # expert_mask=self.expert_mask,
-            # dtype=aiter.dtypes.bf16
-        )
-        
-        # NOTE: DEBUG
-        # DEEPEP
-        fused_moe(
-            hidden_states,
-            self.w13_weight,
-            self.w2_weight,
-            topk_weights,
-            topk_idx,
-            w1_scale=self.w13_weight_scale_inv,
-            w2_scale=self.w2_weight_scale_inv,
-            # a1_scale=scales,
-            num_local_tokens=num_local_tokens_per_expert,
-            quant_type=QuantType.per_128x128,
-            # quant_type=QuantType.per_1x128,
-            activation=(
-                ActivationType.Silu
-                if self.moe_runner_config.activation == "silu"
-                else ActivationType.Gelu
-            ),
-            # expert_mask=self.expert_mask,
-            # dtype=aiter.dtypes.bf16
-        )
-        
-        # fp8_method
-        fused_moe(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            topk_weights,
-            topk_ids,
-            w1_scale=layer.w13_weight_scale_inv,
-            w2_scale=layer.w2_weight_scale_inv,
-            quant_type=QuantType.per_128x128,
-            activation=(
-                ActivationType.Silu
-                if activation == "silu"
-                else ActivationType.Gelu
-            ),
-            expert_mask=None,
+            dtype=aiter.dtypes.bf16
         )
     
     def _topk_idx_conversion(self, topk_idx):
