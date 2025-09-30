@@ -6,15 +6,15 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 
 from sglang.srt.distributed.parallel_state import (
+    get_moe_ep_group,
     get_moe_expert_parallel_world_size,
     get_world_group,
-    get_moe_ep_group, 
 )
 from sglang.srt.layers.moe import (
     get_deepep_mode,
-    get_moriep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    get_moriep_mode,
     should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.ep_moe.kernels import (
@@ -44,8 +44,8 @@ if TYPE_CHECKING:
         DeepEPLLOutput,
         DeepEPNormalOutput,
         DispatchOutput,
-        MoRINormalOutput,
         MoRILLOutput,
+        MoRINormalOutput,
     )
 
 _is_hip = is_hip()
@@ -784,17 +784,20 @@ class DeepEPMoE(EPMoE):
 
         return hidden_states
 
+
 _SHMEM_INITIALIZED = False
 MORI_QUANT_CONFIG = None
+
+
 # NOTE: Currently, the code of MoRIEPMoE is originated from DeepEPMoE.
 #       We need to change it more mori-specific way as we can possible.
 class MoRIEPMoE(EPMoE):
     """
     MoE Expert Parallel Impl based on mori (https://github.com/ROCm/mori)
     """
-    
+
     _has_printed = False
-    
+
     # NOTE: Keep the same interface with DeepEPMoE
     def __init__(
         self,
@@ -825,13 +828,13 @@ class MoRIEPMoE(EPMoE):
         )
         self.moriep_mode = get_moriep_mode()
         self.set_mori_quant_config()
-        
+
         # TODO: move to the beginning of the file
         from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
-        
+
         self._ensure_shmem_initialized()
         self.mori_dispatcher = MaybeTboDeepEPDispatcher(
-            group=get_moe_ep_group(), # NOTE: Give Coordinator
+            group=get_moe_ep_group(),  # NOTE: Give Coordinator
             router_topk=self.top_k,
             permute_fusion=True,
             num_experts=self.num_experts,
@@ -842,12 +845,15 @@ class MoRIEPMoE(EPMoE):
             quant_dtype=self.fp8_dtype,
             moriep_mode=self.moriep_mode,
             async_finish=True,  # TODO
-            return_recv_hook=False, # Currently, not used
+            return_recv_hook=False,  # Currently, not used
         )
 
         if _use_aiter:
+            assert not _is_npu, f"MoRI does not support npu devices."
+
             # expert_mask is of size (self.num_local_experts + 1),
-            # the extra 1 is for invalid rank_id (in original deepep, the invalid rank_id is -1, but aiter does not allow -1, we use a mask to make those ids invalid)
+            # the extra 1 is for invalid rank_id (in original deepep, the invalid rank_id is -1,
+            # but aiter does not allow -1, we use a mask to make those ids invalid)
             # for instance, if we have 4 experts on this rank, we would have a expert_mask like:
             #     self.expert_mask = [1, 1, 1, 1, 0]
             # idx from 0-3 is valid and will be processed, while idx == 4 will be masked out
@@ -858,24 +864,7 @@ class MoRIEPMoE(EPMoE):
             )
             # the last one is invalid rank_id
             self.expert_mask[:-1] = 1
-        elif not _is_npu:
-            self.w13_weight_fp8 = (
-                self.w13_weight,
-                (
-                    self.w13_weight_scale_inv
-                    if self.use_block_quant
-                    else self.w13_weight_scale
-                ),
-            )
-            self.w2_weight_fp8 = (
-                self.w2_weight,
-                (
-                    self.w2_weight_scale_inv
-                    if self.use_block_quant
-                    else self.w2_weight_scale
-                ),
-            )
-    
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -883,13 +872,25 @@ class MoRIEPMoE(EPMoE):
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        output =  torch.zeros_like(hidden_states)
+        assert self.quant_method is not None
+        if self.moe_ep_size > 1 and not self.enable_flashinfer_cutlass_moe:
+            if self.expert_map_cpu is not None and self.expert_map_gpu is None:
+                # If we are in EP mode, we need to move the expert map to GPU.
+                self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
+
+        output = torch.zeros_like(hidden_states)
         dispatch_output = self.dispatch(
             hidden_states, topk_idx, topk_weights, forward_batch
         )
         hidden_states = self.moe_impl(dispatch_output)
-        topk_idx = topk_idx if dispatch_output.topk_idx is None else dispatch_output.topk_idx
-        topk_weights = topk_weights if dispatch_output.topk_weights is None else dispatch_output.topk_weights
+        topk_idx = (
+            topk_idx if dispatch_output.topk_idx is None else dispatch_output.topk_idx
+        )
+        topk_weights = (
+            topk_weights
+            if dispatch_output.topk_weights is None
+            else dispatch_output.topk_weights
+        )
         self.combine(
             output,
             hidden_states,
@@ -912,7 +913,7 @@ class MoRIEPMoE(EPMoE):
             topk_weights=topk_weights,
             forward_batch=forward_batch,
         )
-    
+
     def moe_impl(self, dispatch_output: DispatchOutput):
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
@@ -922,7 +923,7 @@ class MoRIEPMoE(EPMoE):
             return self.forward_aiter(dispatch_output)
         else:
             raise NotImplementedError(f"Currently, only aiter kernel is supported.")
-    
+
     def combine(
         self,
         output: torch.Tensor,
@@ -948,15 +949,14 @@ class MoRIEPMoE(EPMoE):
             dispatch_output.topk_idx,
             dispatch_output.topk_weights,
             dispatch_output.num_recv_tokens_per_expert,
-            dispatch_output.scales
+            dispatch_output.scales,
         )
         if hidden_states.shape[0] == 0:
             return hidden_states
-        # in original deepep, idx == -1 meaning invalid and will not be processed.
-        # aiter does not accept -1, we use a expert mask to make these idx invalid
-        # (idx == num_local_experts) meaning not used in aiter fused_moe
+
         topk_idx = topk_idx.to(torch.int32)
-        topk_idx = self._topk_idx_conversion(topk_idx)
+        if self.expert_map_gpu is not None:
+            topk_idx = self.expert_map_gpu[topk_idx]
 
         return fused_moe(
             hidden_states=hidden_states,
@@ -964,39 +964,24 @@ class MoRIEPMoE(EPMoE):
             w2=self.w2_weight,
             topk_weight=topk_weights,
             topk_ids=topk_idx,
-            # expert_mask=self.expert_mask,
             w1_scale=self.w13_weight_scale_inv,
             w2_scale=self.w2_weight_scale_inv,
             a1_scale=scales,
             num_local_tokens=num_local_tokens_per_expert,
             # NOTE: DSr-1 config follows QuantType.per_128x128 but
-            # already 1x128 scale applied to hidden_states due to fp8 dispatch. 
-            # Also, aiter uses the QuantType.per_128x128 as QuantType.per_1x128 
+            # already 1x128 scale applied to hidden_states due to fp8 dispatch.
+            # Also, aiter uses the QuantType.per_128x128 as QuantType.per_1x128
             # internally. So it doesn't matter to use 1x128 rather than 128x128.
-            quant_type=QuantType.per_1x128, 
+            quant_type=QuantType.per_1x128,
             activation=(
                 ActivationType.Silu
                 if self.moe_runner_config.activation == "silu"
                 else ActivationType.Gelu
             ),
-            dtype=aiter.dtypes.bf16
+            dtype=aiter.dtypes.bf16,
         )
-    
-    def _topk_idx_conversion(self, topk_idx):
-        num_global_experts = self.num_experts
-        num_local_experts = self.num_local_experts
-        start_id = self.moe_ep_rank * num_local_experts
-        end_id = (self.moe_ep_rank + 1) * num_local_experts
-        offset = start_id
-        
-        mask = (topk_idx >= start_id) & (topk_idx < end_id)
-        ret = torch.where(mask, topk_idx, -1)
-        
-        mask = (ret != -1)
-        ret[mask] -= offset
-        return ret
-    
-    # NOTE: Copy from ihbang's vLLM-mori impl PR.
+
+    # NOTE: Maybe move mori config and shmem initialization to where model parallel is initialized
     def _ensure_shmem_initialized(self):
         """Ensure mori's shared memory system is initialized (lazy initialization)"""
         global _SHMEM_INITIALIZED
@@ -1018,12 +1003,16 @@ class MoRIEPMoE(EPMoE):
             backend = dist.get_backend()
             if backend is None:
                 raise RuntimeError("No valid distributed backend found")
-            
-            logger.debug(f"[rank {self.moe_ep_rank}] PyTorch distributed ready with backend: {backend}")
-            # Actually, dist must be initialized to reach here. check init_distributed_environment() at parallel_state.py
-            current_group = ep_group.cpu_group if ep_group.cpu_group is not None else world_group.cpu_group
 
-            # TODO FIXME: why do we register new group and use it to initialize shmem?
+            logger.debug(
+                f"[rank {self.moe_ep_rank}] PyTorch distributed ready with backend: {backend}"
+            )
+            current_group = (
+                ep_group.cpu_group
+                if ep_group.cpu_group is not None
+                else world_group.cpu_group
+            )
+
             group_name = "default"
             try:
                 import torch._C._distributed_c10d as c10d
@@ -1036,44 +1025,56 @@ class MoRIEPMoE(EPMoE):
 
                 # Register the current process group
                 c10d._register_process_group(group_name, current_group)
-                logger.debug(f"[rank {self.moe_ep_rank}] Registered process group '{group_name}'")
+                logger.debug(
+                    f"[rank {self.moe_ep_rank}] Registered process group '{group_name}'"
+                )
 
                 # Initialize mori shmem with the registered group
                 mori.shmem.shmem_torch_process_group_init(group_name)
-                logger.debug(f"[rank {self.moe_ep_rank}] Torch process group shmem initialization successful")
+                logger.debug(
+                    f"[rank {self.moe_ep_rank}] Torch process group shmem initialization successful"
+                )
                 _SHMEM_INITIALIZED = True
                 return
 
             except Exception as torch_error:
-                logger.debug(f"[rank {self.moe_ep_rank}] Torch process group shmem init failed: {torch_error}")
+                logger.debug(
+                    f"[rank {self.moe_ep_rank}] Torch process group shmem init failed: {torch_error}"
+                )
 
             _SHMEM_INITIALIZED = True
 
         except Exception as e:
             # NOTE: Do we need continuing the shmem initialization even it failed?
             #       I think raising error is more proper in this scenario.
-            logger.error(f"[rank {self.moe_ep_rank}] mori shmem initialization failed: {e}")
+            logger.error(
+                f"[rank {self.moe_ep_rank}] mori shmem initialization failed: {e}"
+            )
             # Don't fail completely - mark as initialized to avoid retry loops
             _SHMEM_INITIALIZED = True
-            logger.warning(f"[rank {self.moe_ep_rank}] Continuing without mori shmem optimization")
-            
+            logger.warning(
+                f"[rank {self.moe_ep_rank}] Continuing without mori shmem optimization"
+            )
+
     def set_mori_quant_config(self):
         global MORI_QUANT_CONFIG
         _cfg = {}
-        _cfg['use_block_quant'] = self.use_block_quant
-        _cfg['block_shape'] = self.block_shape
-        _cfg['use_fp8_w8a8'] = self.use_fp8_w8a8
-        _cfg['fp8_dtype'] = self.fp8_dtype
+        _cfg["use_block_quant"] = self.use_block_quant
+        _cfg["block_shape"] = self.block_shape
+        _cfg["use_fp8_w8a8"] = self.use_fp8_w8a8
+        _cfg["fp8_dtype"] = self.fp8_dtype
         MORI_QUANT_CONFIG = _cfg
+
 
 def get_mori_quant_config() -> dict:
     global MORI_QUANT_CONFIG
     return MORI_QUANT_CONFIG
 
+
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
     if get_moe_a2a_backend().is_deepep():
         return DeepEPMoE
-    
+
     if get_moe_a2a_backend().is_mori():
         return MoRIEPMoE
 

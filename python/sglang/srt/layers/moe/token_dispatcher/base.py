@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from enum import Enum, auto
+from enum import Enum
 from typing import TYPE_CHECKING, Protocol, TypeGuard, Union, runtime_checkable
 
 import torch
@@ -13,12 +13,12 @@ if TYPE_CHECKING:
         DeepEPLLOutput,
         DeepEPNormalCombineInput,
         DeepEPNormalOutput,
-        StandardCombineInput,
-        StandardDispatchOutput,
         MoRILLCombineInput,
         MoRILLOutput,
         MoRINormalCombineInput,
         MoRINormalOutput,
+        StandardCombineInput,
+        StandardDispatchOutput,
     )
     from sglang.srt.layers.moe.topk import TopKOutput
 
@@ -56,13 +56,13 @@ class DispatchOutputChecker:
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[AscendDeepEPLLOutput]:
         return dispatch_output.format.is_ascent_ll()
-    
+
     @staticmethod
     def format_is_mori(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[Union[MoRINormalOutput, MoRILLOutput]]:
         return dispatch_output.format.is_mori()
-    
+
     @staticmethod
     def format_is_mori_normal(
         dispatch_output: DispatchOutput,
@@ -102,16 +102,16 @@ class DispatchOutputFormat(Enum):
 
     def is_ascent_ll(self) -> bool:
         return self == DispatchOutputFormat.ASCENT_LL
-    
+
     def is_mori(self) -> bool:
         return self in [
             DispatchOutputFormat.MORI_NORMAL,
             DispatchOutputFormat.MORI_LL,
         ]
-    
+
     def is_mori_normal(self) -> bool:
         return self == DispatchOutputFormat.MORI_NORMAL
-    
+
     def is_mori_ll(self) -> bool:
         return self == DispatchOutputFormat.MORI_LL
 
@@ -156,7 +156,7 @@ class CombineInputChecker:
             CombineInputFormat.DEEPEP_NORMAL,
             CombineInputFormat.DEEPEP_LL,
         ]
-    
+
     @staticmethod
     def format_is_mori_normal(
         combine_input: CombineInput,
@@ -168,8 +168,7 @@ class CombineInputChecker:
         combine_input: CombineInput,
     ) -> TypeGuard[MoRILLCombineInput]:
         return combine_input.format == CombineInputFormat.MORI_LL
-    
-    
+
     @staticmethod
     def format_is_mori(
         combine_input: CombineInput,

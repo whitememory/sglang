@@ -657,6 +657,7 @@ class ServerArgs:
                 )
 
         # TODO : support eplb/expert distribution recording when MoRI
+        # MoRI MoE
         if self.moe_a2a_backend == "mori":
             if not _use_aiter:
                 self.moe_a2a_backend = "none"
@@ -667,6 +668,14 @@ class ServerArgs:
                 self.expert_distribution_recorder_mode = None
                 self.enable_eplb = False
                 logger.warning("MoRI does not support EPLB for now.")
+
+            assert (
+                self.moriep_mode == "low_latency"
+            ), f"Currently MoRI supports low_latency only."
+
+            assert (
+                not self.enable_two_batch_overlap
+            ), f"Currently MoRI does not support TBO."
 
         # DeepEP MoE
         if self.moe_a2a_backend in ("deepep", "mori"):
@@ -1930,6 +1939,7 @@ class ServerArgs:
             action="store_true",
             help="Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention.",
         )
+        # NOTE: Disable this argument until implementing tbo on mori backend.
         parser.add_argument(
             "--enable-two-batch-overlap",
             action="store_true",

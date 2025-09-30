@@ -368,6 +368,7 @@ class DeepseekV2MoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
         )
+
         correction_bias = self.gate.e_score_correction_bias
         if _is_fp4_quantization_enabled():
             correction_bias = correction_bias.to(torch.bfloat16)
@@ -401,7 +402,6 @@ class DeepseekV2MoE(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()  # TODO: dense(no tp) for shared_expert for mori too?
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                    or get_moe_a2a_backend().is_mori()
                     or get_moe_a2a_backend().is_mori()
                     else {}
                 ),
@@ -641,7 +641,7 @@ class DeepseekV2MoE(nn.Module):
         if self.tp_size > 1 and not should_allreduce_fusion:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
-    
+
     # NOTE: We need to change the func name because it supports deepep and mori both.
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
@@ -649,7 +649,7 @@ class DeepseekV2MoE(nn.Module):
         shared_output = None
         is_deepep = get_moe_a2a_backend().is_deepep()
         is_mori = get_moe_a2a_backend().is_mori()
-        
+
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
@@ -658,13 +658,13 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 router_logits,
                 num_token_non_padded=(
-                    forward_batch.num_token_non_padded if (is_deepep or is_mori) else None
+                    forward_batch.num_token_non_padded if is_deepep else None
                 ),
                 expert_location_dispatch_info=(
                     ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     )
-                    if (is_deepep or is_mori)
+                    if is_deepep
                     else None
                 ),
             )
@@ -692,8 +692,8 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states = shared_output + final_hidden_states
         else:
             raise RuntimeError(f"Not supported a2a backend: {get_moe_a2a_backend()}")
-        
-        return final_hidden_states    
+
+        return final_hidden_states
 
     def _forward_shared_experts(
         self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None

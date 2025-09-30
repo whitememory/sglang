@@ -103,7 +103,7 @@ class DeepEPMode(Enum):
     def is_auto(self) -> bool:
         return self == DeepEPMode.AUTO
 
-# NOTE: Check the name is appropriate or not. (MoRIEP / MoRI)
+
 class MoRIEPMode(Enum):
 
     NORMAL = "normal"
@@ -157,12 +157,11 @@ def initialize_moe_config(server_args: ServerArgs):
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
 
-    # TODO: Add MORIEP_MODE (and MORIEP_CONFIG if needed) initialization
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
     DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
     DEEPEP_CONFIG = server_args.deepep_config or ""
-    MORIEP_MODE = MoRIEPMode(server_args.moriep_mode) # GW: currently "low_latency" is supported
+    MORIEP_MODE = MoRIEPMode(server_args.moriep_mode)
     MORIEP_CONFIG = ""
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
     TBO_TOKEN_DISTRIBUTION_THRESHOLD = server_args.tbo_token_distribution_threshold

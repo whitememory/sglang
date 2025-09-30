@@ -6,9 +6,9 @@ from sglang.srt.layers.moe.utils import (
     MoRIEPMode,
     get_deepep_config,
     get_deepep_mode,
-    get_moriep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    get_moriep_mode,
     get_tbo_token_distribution_threshold,
     initialize_moe_config,
     is_tbo_enabled,
@@ -18,8 +18,7 @@ from sglang.srt.layers.moe.utils import (
 
 __all__ = [
     "DeepEPMode",
-    "MoRIEPMode"
-    "MoeA2ABackend",
+    "MoRIEPMode" "MoeA2ABackend",
     "MoeRunner",
     "MoeRunnerConfig",
     "MoeRunnerBackend",
@@ -32,5 +31,5 @@ __all__ = [
     "is_tbo_enabled",
     "get_tbo_token_distribution_threshold",
     "get_deepep_config",
-    "get_moriep_mode"
+    "get_moriep_mode",
 ]
