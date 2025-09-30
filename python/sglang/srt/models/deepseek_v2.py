@@ -198,7 +198,6 @@ class AttnForwardMethod(IntEnum):
 
 
 class DeepseekV2MLP(nn.Module):
-    layer_id = 0 # NOTE: DEBUG
     def __init__(
         self,
         hidden_size: int,
@@ -239,55 +238,6 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    # NOTE: DEBUG
-    # def forward(
-    #     self,
-    #     x,
-    #     forward_batch=None,
-    #     should_allreduce_fusion: bool = False,
-    #     use_reduce_scatter: bool = False,
-    #     gemm_output_zero_allocator: BumpAllocator = None,
-    # ):
-    #     from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
-    #     if (self.tp_size == 1) and x.shape[0] == 0:
-    #         return x
-
-    #     _backend_name = ""
-    #     if get_moe_a2a_backend().is_mori():
-    #         _backend_name = "mori/"
-    #     else:
-    #         _backend_name = "naive/"
-    #     _dir = f"/sgl-workspace/log_dir/" + _backend_name + "shared_expert/"
-    #     _file_name = f"rank_{get_tensor_model_parallel_rank()}"
-    #     file_path = _dir + _file_name
-    #     try:
-    #         with open(file_path, 'a', encoding='utf-8') as f:
-    #             f.write(f"layer_{self.layer_id}\n")
-    #             f.write(f"Initial hidden state: {x}, {x.shape}\n")
-
-    #             if gemm_output_zero_allocator != None and x.shape[0] <= 256:
-    #                 y = gemm_output_zero_allocator.allocate(
-    #                     x.shape[0] * self.gate_up_proj.output_size_per_partition
-    #                 ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
-    #                 x = (x, None, y)
-
-    #             gate_up, _ = self.gate_up_proj(x)
-    #             x = self.act_fn(gate_up)
-    #             x, _ = self.down_proj(
-    #                 x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
-    #             )
-
-    #             f.write(f"After up_proj: {x}, {x.shape}\n\n")
-    #             self._next_layer_id()
-    #             return x
-    #     except IOError as e:
-    #         raise IOError(f"IO error occured while writing on {file_path}")
-
-    @classmethod
-    def _next_layer_id(cls):
-        cls.layer_id += 1
-
-    # NOTE: original
     def forward(
         self,
         x,
@@ -418,7 +368,6 @@ class DeepseekV2MoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
         )
-
         correction_bias = self.gate.e_score_correction_bias
         if _is_fp4_quantization_enabled():
             correction_bias = correction_bias.to(torch.bfloat16)
@@ -553,10 +502,6 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                 )
         else:
-            # if self._enable_moriep_moe:
-            #     return self.forward_moriep(hidden_states, forward_batch, gemm_output_zero_allocator)
-            # else:
-            #     return self.forward_deepep(hidden_states, forward_batch)
             return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal_dual_stream(
@@ -697,17 +642,7 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
     
-    # NOTE: DEBUG
-    def _force_hidden_state_injection(self, hidden_states: torch.tensor):
-        from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
-        _hs_shape = [1, hidden_states.shape[-1]]
-        _fill_value = get_tensor_model_parallel_rank() + 1
-        _dtype = hidden_states.dtype
-        assert _dtype == torch.bfloat16, f"dtype not matched: {_dtype=}"
-        _temp_tensor = torch.full(_hs_shape, _fill_value, dtype=hidden_states.dtype).to(hidden_states.device)
-        return _temp_tensor
-        # hidden_states.copy_(_temp_tensor)
-
+    # NOTE: We need to change the func name because it supports deepep and mori both.
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
@@ -715,7 +650,6 @@ class DeepseekV2MoE(nn.Module):
         is_deepep = get_moe_a2a_backend().is_deepep()
         is_mori = get_moe_a2a_backend().is_mori()
         
-        # hidden_states = self._force_hidden_state_injection(hidden_states) # NOTE: DEBUG
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
@@ -747,7 +681,6 @@ class DeepseekV2MoE(nn.Module):
         )
 
         if is_deepep:
-            # if shared_output is not None and is_deepep:
             if shared_output is not None:
                 x = shared_output
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
@@ -760,68 +693,7 @@ class DeepseekV2MoE(nn.Module):
         else:
             raise RuntimeError(f"Not supported a2a backend: {get_moe_a2a_backend()}")
         
-        # NOTE: DEBUG
-        # from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_rank
-        # if get_moe_expert_parallel_rank() == 0:
-        #     print(f"{final_hidden_states=}")
-        
-        return final_hidden_states
-
-
-    # NOTE: FOR DEBUG
-    # def forward_moriep(
-    #         self, 
-    #         hidden_states: torch.Tensor, 
-    #         forward_batch: ForwardBatch,
-    #         gemm_output_zero_allocator: BumpAllocator = None
-    # ) -> torch.Tensor:
-    #     shared_output = None
-    #     is_deepep = get_moe_a2a_backend().is_deepep()
-    #     is_mori = get_moe_a2a_backend().is_mori()
-        
-    #     # hidden_states = self._force_hidden_state_injection(hidden_states)
-        
-        
-    #     if hidden_states.shape[0] > 0:
-    #         # router_logits: (num_tokens, n_experts)
-    #         shared_output = self._forward_shared_experts(
-    #             hidden_states, 
-    #             gemm_output_zero_allocator
-    #         )
-    #         router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-    #         topk_weights, topk_idx, _ = self.topk(hidden_states, router_logits)
-    #     else:
-    #         topk_weights, topk_idx, _ = self.topk.empty_topk_output(
-    #             hidden_states.device
-    #         )
-
-    #     final_hidden_states = self.experts(
-    #         hidden_states=hidden_states,
-    #         topk_idx=topk_idx,
-    #         topk_weights=topk_weights,
-    #         forward_batch=forward_batch,
-    #     )
-
-    #     if is_deepep:
-    #         # if shared_output is not None and is_deepep:
-    #         if shared_output is not None:
-    #             x = shared_output
-    #             x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
-    #             final_hidden_states = x
-    #         else:
-    #             final_hidden_states *= self.routed_scaling_factor
-    #     elif is_mori:
-    #         if shared_output is not None:
-    #             final_hidden_states = shared_output + final_hidden_states
-    #     else:
-    #         raise RuntimeError(f"Not supported a2a backend: {get_moe_a2a_backend()}")
-        
-    #     from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_rank
-    #     if get_moe_expert_parallel_rank() == 0:
-    #         print(f"{final_hidden_states=}")
-        
-    #     return final_hidden_states
-    
+        return final_hidden_states    
 
     def _forward_shared_experts(
         self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None

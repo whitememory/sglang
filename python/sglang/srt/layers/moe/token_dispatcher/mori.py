@@ -229,19 +229,13 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
                 get_hip_quant,
                 QuantType
             )
-            # quant_type = QuantType.per_128x128 # 128x128 not supported
+            # NOTE: get_hip_quant not supports QuantType.per_128x128.
             quant_type = QuantType.per_1x128
             quant_func = get_hip_quant(quant_type)
             hidden_states, scales = quant_func(
                 hidden_states,
-                # quant_dtype=self.quant_dtype,
                 quant_dtype=aiter.dtypes.fp8,
             )
-        
-        # from mori dispatch assert code
-        if scales is not None:
-            assert  (scales.is_contiguous() and scales.element_size() == self.config.scale_type_size), \
-                    f"{scales.is_contiguous()=} and {scales.element_size()=} == {self.config.scale_type_size=}"
             
         (
             dispatch_output,
@@ -272,10 +266,6 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
         topk_weights: torch.Tensor,
         use_fp8_w8a8: bool = False,
     ):
-        # NOTE: Question: Does combine process not need original number of tokens?
-        #       I can't find any reorder and slicing procedure to get original-sized 
-        #       'hidden_states' with using aiter.
-        
         num_original_tokens = output.shape[0]  # Original number of tokens
 
         try:
@@ -287,9 +277,6 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
             output.copy_(
                 combined_outputs[:num_original_tokens], non_blocking=True
             )
-            # In this case, return not needed. 
-            # return output
-
         except Exception as e:
             logger.error(f"mori combine failed: {e}")
             raise RuntimeError(f"mori combine failed: {e}") from e
@@ -332,15 +319,8 @@ class MoRIDispatcher(BaseDispatcher):
         
         # TODO: Clean the unused APIs
         from sglang.srt.distributed.parallel_state import (
-            get_tensor_model_parallel_rank,
-            get_world_group,
             get_tp_group,
-            get_moe_expert_parallel_world_size,
             in_the_same_node_as,
-        )
-        from sglang.srt.layers.dp_attention import (
-            get_attention_tp_rank,
-            is_dp_attention_enabled,
         )
 
         self.group = group.device_group
@@ -407,9 +387,7 @@ class MoRIDispatcher(BaseDispatcher):
         num_experts_per_rank: int,
         num_experts_per_token: int,
         data_type: torch.dtype = torch.bfloat16,
-        scale_dim: int = 0,
-        scale_type_size: int = 0,        
-    ):
+    ):        
         global _GLOBAL_MORI_CONFIG
         if _GLOBAL_MORI_CONFIG is not None:
             return _GLOBAL_MORI_CONFIG
@@ -424,6 +402,8 @@ class MoRIDispatcher(BaseDispatcher):
         }
         max_token_type_size = dtype_to_size.get(data_type, 2)
 
+        scale_shape = self.scale_shape(max_num_tokens, hidden_dim)
+        _scale_dim = scale_shape[-1] if scale_shape is not None else 0
         _scale_type_size = torch.float32.itemsize
         _GLOBAL_MORI_CONFIG = EpDispatchCombineConfig(
             data_type=data_type,
@@ -440,9 +420,8 @@ class MoRIDispatcher(BaseDispatcher):
             max_token_type_size=max_token_type_size,
 
             # Quantization support
-            # NOTE: scale_dim calculation from vLLM's `scale_shape` function.
-            # 56 from cdiv(hidden_dim, block_shape[-1])
-            scale_dim=56, 
+            # NOTE: scale_dim calc function from vLLM's `scale_shape` function.
+            scale_dim=_scale_dim,
             scale_type_size=_scale_type_size, # scale from aiter uses fp32
 
             # Use internal buffer management
@@ -461,7 +440,6 @@ class MoRIDispatcher(BaseDispatcher):
 
         return _GLOBAL_MORI_CONFIG
           
-    #def dispatch(self, *args, **kwargs) -> DispatchOutput:
     def dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -476,7 +454,6 @@ class MoRIDispatcher(BaseDispatcher):
         )
         return ret
     
-    #def conbine(self, *args, **kwargs) -> Tuple:
     def combine(
         self,
         output: torch.Tensor,
@@ -503,6 +480,27 @@ class MoRIDispatcher(BaseDispatcher):
             return self._low_latency_dispatcher
         else:
             raise ValueError(f"Invalid moriep_mode: {self.moriep_mode}")
-    
-    
+        
+    def scale_shape(
+        self,
+        max_tokens: int,
+        hidden_dim: int,
+    ) -> Optional[tuple[int, int]]:
+        from sglang.srt.layers.moe.ep_moe.layer import get_mori_quant_config
+        global _use_fp8_dispatch
+        quant_config = get_mori_quant_config()
+        
+        if _use_fp8_dispatch and self.use_fp8_w8a8:
+            if quant_config['use_block_quant']:
+                assert quant_config['block_shape'] is not None
+                _, block_k = quant_config['block_shape']
+                k_tiles = cdiv(hidden_dim, block_k)
+                return (max_tokens, k_tiles)
+            else:
+                return (1, 1)
+        else:
+            return None
 
+def cdiv(a: int, b: int) -> int:
+    """Ceiling division."""
+    return -(a // -b)
