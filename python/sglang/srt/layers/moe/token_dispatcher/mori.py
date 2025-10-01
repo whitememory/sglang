@@ -134,18 +134,6 @@ class MoRIDispatchMode(IntEnum):
     LOW_LATENCY = auto()
 
 
-# NOTE: Actually... not needed, only skeleton code
-#       actual implementation should be done inside of MoRIDispatcher
-class MoRIBuffer:
-    pass
-
-
-# NOTE: Actually... not needed, only skeleton code
-#       actual implementation should be done inside of MoRIDispatcher
-class MoRIConfig(BaseDispatcherConfig):
-    pass
-
-
 _GLOBAL_MORI_OPS_HANDLE: EpDispatchCombineOp = None
 _GLOBAL_MORI_CONFIG: EpDispatchCombineConfig = None
 
@@ -172,6 +160,7 @@ class _MoRIDispatcherImplBase:
             self._ops_handle = _GLOBAL_MORI_OPS_HANDLE
         self.use_fp8_w8a8 = use_fp8_w8a8
         self.quant_dtype = quant_dtype
+        self.moriep_mode = moriep_mode
 
     def dispatch(
         self,
@@ -227,6 +216,9 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
         use_fp8_w8a8: bool = False,
         quant_dtype: torch.dtype = torch.float8_e4m3fn,
     ):
+        assert (
+            moriep_mode == MoRIEPMode.LOW_LATENCY
+        ), f"Invalid moriep_mode: {moriep_mode}."
         super().__init__(config, moriep_mode, use_fp8_w8a8, quant_dtype)
 
     def dispatch(
@@ -274,7 +266,6 @@ class _MoRIDispatcherImplLowLatency(_MoRIDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        use_fp8_w8a8: bool = False,
     ):
         num_original_tokens = output.shape[0]  # Original number of tokens
 
@@ -349,7 +340,7 @@ class MoRIDispatcher(BaseDispatcher):
         self.world_size = get_tp_group().world_size
 
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
-            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
+            "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 256
         )
 
         self.config = self._make_mori_config(

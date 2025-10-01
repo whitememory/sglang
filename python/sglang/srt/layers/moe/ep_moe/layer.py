@@ -834,7 +834,7 @@ class MoRIEPMoE(EPMoE):
 
         self._ensure_shmem_initialized()
         self.mori_dispatcher = MaybeTboDeepEPDispatcher(
-            group=get_moe_ep_group(),  # NOTE: Give Coordinator
+            group=get_moe_ep_group(),  # NOTE: MoRIDispatcher requires GroupCoordinator
             router_topk=self.top_k,
             permute_fusion=True,
             num_experts=self.num_experts,
@@ -957,6 +957,7 @@ class MoRIEPMoE(EPMoE):
         topk_idx = topk_idx.to(torch.int32)
         if self.expert_map_gpu is not None:
             topk_idx = self.expert_map_gpu[topk_idx]
+        topk_idx[topk_idx == -1] = self.num_local_experts
 
         return fused_moe(
             hidden_states=hidden_states,
@@ -979,6 +980,7 @@ class MoRIEPMoE(EPMoE):
                 else ActivationType.Gelu
             ),
             dtype=aiter.dtypes.bf16,
+            expert_mask=self.expert_mask,
         )
 
     # NOTE: Maybe move mori config and shmem initialization to where model parallel is initialized
