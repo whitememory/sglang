@@ -36,7 +36,14 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils import (
+    ceil_div,
+    dispose_tensor,
+    get_bool_env_var,
+    get_int_env_var,
+    is_hip,
+    is_npu,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -828,6 +835,10 @@ class MoRIEPMoE(EPMoE):
         )
         self.moriep_mode = get_moriep_mode()
         self.set_mori_quant_config()
+        # FIXME: This env var used in MoRIDispatcher. We may change the location where getting this variable.
+        self.num_max_dispatch_tokens_per_rank = get_int_env_var(
+            "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 256
+        )
 
         # TODO: move to the beginning of the file
         from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
@@ -865,6 +876,10 @@ class MoRIEPMoE(EPMoE):
             # the last one is invalid rank_id
             self.expert_mask[:-1] = 1
 
+    # TODO: Currently MoRI supports only `low-latency` mode which generates static-sized communication buffer.
+    # So, when another mode (like deepep's high throughput mode) be added, we should change the execution path.
+    # FIXME: Chunked forward is implemented but it does not distinguish the `forward_batch.forward_mode` now.
+    # If we need separating both prefill and decode path, fix the code below later.
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -878,7 +893,68 @@ class MoRIEPMoE(EPMoE):
                 # If we are in EP mode, we need to move the expert map to GPU.
                 self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
 
+        local_num_tokens = hidden_states.shape[0]
+        max_num_tokens_over_dp_ranks = max(forward_batch.global_num_tokens_cpu)
+        step = self.num_max_dispatch_tokens_per_rank
+
+        num_valid_forward, num_pad_forward = self.get_loop_count(
+            local_num_tokens, max_num_tokens_over_dp_ranks, step
+        )
         output = torch.zeros_like(hidden_states)
+
+        if num_valid_forward > 0:
+            _range = list(range(0, local_num_tokens, step))
+            if _range[-1] != local_num_tokens:
+                _range = _range + [local_num_tokens]
+
+            for idx, val in enumerate(_range[:-1]):
+                _start = _range[idx]
+                _end = _range[idx + 1]
+                self.forward_single(
+                    output=output[_start:_end, :],
+                    hidden_states=hidden_states[_start:_end, :],
+                    topk_idx=topk_idx[_start:_end, :],
+                    topk_weights=topk_weights[_start:_end, :],
+                    forward_batch=forward_batch,
+                )
+        if num_pad_forward > 0:
+            _empty_output = torch.empty(
+                (0, hidden_states.shape[-1]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            _empty_hidden_states = torch.empty(
+                (0, hidden_states.shape[-1]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            _empty_topk_idx = torch.empty(
+                (0, topk_idx.shape[-1]), device=topk_idx.device, dtype=topk_idx.dtype
+            )
+            _empty_topk_weights = torch.empty(
+                (0, topk_weights.shape[-1]),
+                device=topk_weights.device,
+                dtype=topk_weights.dtype,
+            )
+        for _ in range(0, num_pad_forward):
+            self.forward_single(
+                output=_empty_output,
+                hidden_states=_empty_hidden_states,
+                topk_idx=_empty_topk_idx,
+                topk_weights=_empty_topk_weights,
+                forward_batch=forward_batch,
+            )
+
+        return output
+
+    def forward_single(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
         dispatch_output = self.dispatch(
             hidden_states, topk_idx, topk_weights, forward_batch
         )
@@ -898,7 +974,17 @@ class MoRIEPMoE(EPMoE):
             dispatch_output.topk_weights,
             forward_batch,
         )
-        return output
+
+    def get_loop_count(self, local_num_tokens, max_num_tokens, step):
+        if local_num_tokens == 0:
+            num_valid_forward = 0
+        else:
+            num_valid_forward = ceil_div(local_num_tokens, step)
+        num_pad_forward = ceil_div(max_num_tokens, step) - num_valid_forward
+        assert (
+            num_pad_forward >= 0
+        ), f"Invalid configuration for forward_batch: {local_num_tokens=}, {max_num_tokens=}, {step=}"
+        return num_valid_forward, num_pad_forward
 
     def dispatch(
         self,
