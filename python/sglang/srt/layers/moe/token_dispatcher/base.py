@@ -8,7 +8,6 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
-        AscendDeepEPLLOutput,
         DeepEPLLCombineInput,
         DeepEPLLOutput,
         DeepEPNormalCombineInput,
